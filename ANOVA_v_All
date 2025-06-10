@@ -1,0 +1,117 @@
+import pandas as pd
+import scipy.stats as stats
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+import scikit_posthocs as sp
+import pingouin as pg
+import itertools
+
+# User-defined variables
+file_path = "/Volumes/lab-kohlj/home/shared/projects/Ontogeny/Data/ExtendedData13/Volume.csv"
+paired = False  # If you want a paired test, set to True
+
+def significance_stars(p_value):
+    if p_value < 0.0001:
+        return "****"
+    elif p_value < 0.001:
+        return "***"
+    elif p_value < 0.01:
+        return "**"
+    elif p_value < 0.05:
+        return "*"
+    else:
+        return ""
+
+def perform_all_vs_all_anova(file_path, paired=False):
+    print(f"Loading data from: {file_path}")
+    df = pd.read_csv(file_path, header=0)
+    df = df.apply(pd.to_numeric, errors='coerce')
+
+    df = df[[col for col in df.columns if col.startswith("P")]]
+    print(f"Columns used for analysis: {list(df.columns)}")
+
+    print("Preview of loaded data:")
+    print(df.head())
+
+    melted_df = df.melt(var_name='Group', value_name='Value').dropna()
+    print(f"Data melted for analysis. Total data points: {melted_df.shape[0]}")
+
+    valid_columns = [col for col in df.columns if df[col].dropna().shape[0] >= 3]
+    if not valid_columns:
+        raise ValueError("None of the columns have at least 3 values for normality testing.")
+
+    normality_pvals = {col: stats.shapiro(df[col].dropna())[1] for col in valid_columns}
+    normal = all(p > 0.05 for p in normality_pvals.values())
+    print(f"Normality test results: {normality_pvals}\nData distribution is {'normal' if normal else 'not normal'}")
+
+    comparison_pairs = list(itertools.combinations(df.columns, 2))
+    results_list = []
+
+    for group1, group2 in comparison_pairs:
+        print(f"\nComparing: {group1} vs {group2}")
+        comparison_df = melted_df[melted_df['Group'].isin([group1, group2])].dropna()
+
+        if normal:
+            print("Performing ANOVA test...")
+            model = smf.ols('Value ~ C(Group)', data=comparison_df).fit()
+            anova_table = sm.stats.anova_lm(model, typ=2)
+            test_name = "ANOVA"
+            p_value = anova_table["PR(>F)"].values[0]
+
+            print("Performing pairwise t-test with Holm correction...")
+            posthoc_results = pg.pairwise_tests(dv='Value', between='Group', data=comparison_df, padjust='holm')
+
+            # Identify the correct row
+            row = posthoc_results[
+                ((posthoc_results['A'] == group1) & (posthoc_results['B'] == group2)) |
+                ((posthoc_results['A'] == group2) & (posthoc_results['B'] == group1))
+            ]
+
+            # Safely extract p-corr or fall back to p-unc if correction not available
+            if not row.empty:
+                if 'p-corr' in row.columns:
+                    corrected_p_value = row['p-corr'].values[0]
+                elif 'p-adjust' in row.columns:
+                    corrected_p_value = row['p-adjust'].values[0]
+                else:
+                    corrected_p_value = row['p-unc'].values[0]
+            else:
+                corrected_p_value = None
+            posthoc_test = "Pairwise t-test (Holm)"
+        else:
+            print("Performing Kruskal-Wallis test...")
+            group1_vals = df[group1].dropna()
+            group2_vals = df[group2].dropna()
+            test_name = "Kruskal-Wallis"
+            _, p_value = stats.kruskal(group1_vals, group2_vals)
+
+            print("Performing Dunn’s post-hoc test with Holm correction...")
+            posthoc_matrix = sp.posthoc_dunn([group1_vals, group2_vals], p_adjust='holm')
+            corrected_p_value = posthoc_matrix.iloc[0, 1]
+            posthoc_test = "Dunn’s (Holm)"
+
+        significance = significance_stars(p_value)
+
+        results_list.append({
+            'Group 1': group1,
+            'Group 2': group2,
+            'Parametric': normal,
+            'Test Used': test_name,
+            'Posthoc Test': posthoc_test,
+            'Raw p-value': p_value,
+            'Corrected p-value': corrected_p_value,
+            'Significance': significance
+        })
+
+    results_df = pd.DataFrame(results_list)
+    output_file = file_path.replace(".csv", "_results.csv")
+    results_df.to_csv(output_file, index=False)
+    print(f"\nResults saved to: {output_file}")
+
+    return results_df
+
+# Run the updated analysis
+results_df = perform_all_vs_all_anova(file_path, paired)
+
+print("\nFinal Results:")
+print(results_df)
