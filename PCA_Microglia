@@ -1,0 +1,100 @@
+# Import necessary libraries
+import pandas as pd
+import numpy as np
+import umap
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from scipy.spatial.distance import cdist
+
+# Specify the path to the individual dataset file
+file_path = "FILEPATH.csv"  # Replace with your actual file path
+
+# Load the dataset
+data = pd.read_csv(file_path)
+
+# Drop rows with NaN values
+data = data.dropna()
+
+# Extract IDs and store separately
+ids = data.iloc[:, 0]
+# Drop the ID column for analysis
+data = data.drop(data.columns[0], axis=1)
+
+# Add metadata columns
+data['SourceFile'] = file_path
+data['ID'] = ids
+data['Cluster'] = data['ID'].str[:2]  # Cluster based on first 2 chars of ID
+
+# Prepare data for PCA and KMeans by selecting numeric features
+feature_data = data.drop(['SourceFile', 'Cluster', 'ID'], axis=1, errors='ignore')
+feature_data = feature_data.select_dtypes(include=[np.number])
+
+# Standardize features
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(feature_data)
+
+# Perform PCA
+pca = PCA(n_components=2)
+pca_result = pca.fit_transform(X_scaled)
+
+# Get PCA loadings
+loadings = pd.DataFrame(
+    pca.components_.T,
+    columns=[f'PC{i+1}' for i in range(pca.n_components_)],
+    index=feature_data.columns
+)
+print("\nPCA Loadings (feature contributions):")
+print(loadings)
+
+# Variance explained
+explained_variance = pca.explained_variance_ratio_ * 100
+print(f"\nVariance explained by PC1: {explained_variance[0]:.2f}%")
+print(f"Variance explained by PC2: {explained_variance[1]:.2f}%")
+
+# Perform K-means clustering
+kmeans = KMeans(n_clusters=4, random_state=42)
+kmeans_labels = kmeans.fit_predict(X_scaled)
+data['KMeansCluster'] = kmeans_labels
+
+# Perform UMAP on scaled data
+umap_model = umap.UMAP(n_components=2, random_state=42)
+umap_result = umap_model.fit_transform(X_scaled)
+
+# Create result DataFrames
+pca_df = pd.DataFrame(data=pca_result, columns=['PC1', 'PC2'])
+umap_df = pd.DataFrame(data=umap_result, columns=['UMAP1', 'UMAP2'])
+
+# Combine all information
+final_df = pd.concat([pd.Series(ids, name='ID'), data, pca_df, umap_df], axis=1)
+
+# Compute UMAP cluster centers (based on KMeans clusters)
+cluster_centers = final_df.groupby('KMeansCluster')[['UMAP1', 'UMAP2']].mean()
+
+print("\nUMAP cluster centers (KMeans clusters):")
+print(cluster_centers)
+
+# Compute pairwise distances
+distances = cdist(cluster_centers, cluster_centers, metric='euclidean')
+distance_df = pd.DataFrame(distances, index=cluster_centers.index, columns=cluster_centers.index)
+print("\nPairwise Euclidean distances between KMeans cluster centers:")
+print(distance_df)
+
+# Save final data to CSV
+output_file = "/Users/jamiesb/Desktop/Axon_PCA_KMeans.csv"
+final_df.to_csv(output_file, index=False)
+print(f"\nFinal dataframe with PCA, UMAP, and clustering saved to: {output_file}")
+
+# Plot UMAP with KMeans clusters
+plt.figure(figsize=(10, 8))
+for cluster in sorted(final_df['KMeansCluster'].unique()):
+    cluster_data = final_df[final_df['KMeansCluster'] == cluster]
+    plt.scatter(cluster_data['UMAP1'], cluster_data['UMAP2'], label=f'Cluster {cluster}', alpha=0.7)
+plt.scatter(cluster_centers['UMAP1'], cluster_centers['UMAP2'], c='black', s=100, alpha=0.8, marker='X', label='Cluster Centers')
+plt.xlabel('UMAP1')
+plt.ylabel('UMAP2')
+plt.title('UMAP of Morphometric Features (K-means Clusters)')
+plt.legend()
+plt.tight_layout()
+plt.show()
