@@ -1,0 +1,58 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+
+# Path to directory containing spine statistics CSV files
+data_dir = "DIRECTORY"
+
+# Columns to include for clustering
+clustering_columns = [
+    'COLUMN 1', 'COLUMN 2 etc'
+]
+
+# Load and filter all CSV files in the directory
+data_list = []
+for file_name in os.listdir(data_dir):
+    if file_name.endswith(".csv"):
+        file_path = os.path.join(data_dir, file_name)
+        df = pd.read_csv(file_path).dropna()
+        df = df.drop(df.columns[0], axis=1)  # Drop ID column
+        df = df[clustering_columns]  # Keep only the desired features
+        data_list.append(df)
+
+# Concatenate data from all files
+all_data = pd.concat(data_list, ignore_index=True).dropna()
+
+# Standardize the data
+scaler = StandardScaler()
+scaled_data = scaler.fit_transform(all_data)
+
+# Find optimal number of clusters using the elbow method
+inertia = []
+k_range = range(1, 11)
+
+for k in k_range:
+    kmeans = KMeans(n_clusters=k, random_state=42)
+    kmeans.fit(scaled_data)
+    inertia.append(kmeans.inertia_)
+
+# Estimate elbow point using the second derivative
+second_derivative = np.diff(inertia, 2)
+elbow_point = np.argmin(second_derivative) + 2  # +2 because np.diff reduces size by 2
+
+# Plot elbow curve
+plt.figure(figsize=(8, 6))
+plt.plot(k_range, inertia, marker='o', label='Inertia')
+plt.axvline(x=elbow_point, color='r', linestyle='--', label=f'Elbow Point (K={elbow_point})')
+plt.xlabel('Number of Clusters (K)')
+plt.ylabel('Inertia')
+plt.title('Elbow Method for Optimal K')
+plt.xticks(k_range)
+plt.legend()
+plt.grid()
+plt.show()
+
+print(f"The optimal number of clusters (elbow point) is: {elbow_point}")
