@@ -1,0 +1,96 @@
+import pandas as pd
+import os
+import numpy as np
+from lifelines import KaplanMeierFitter
+from lifelines.statistics import logrank_test
+import warnings
+from statsmodels.stats.multitest import multipletests  # For Benjamini-Hochberg FDR
+
+# Suppress warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+# File paths
+file_path = 'FILEPATH.csv'  # Update with the actual file path
+
+# Load data
+retr = pd.read_csv(file_path)
+
+# Reshape data for Kaplan-Meier analysis
+df_long = pd.melt(retr, id_vars=[], var_name='Timepoint', value_name='Retrieval')
+
+# Create the event column where retrieval < 600 is considered an event
+df_long['Event'] = np.where(df_long['Retrieval'] < 600, 1, 0)
+
+# Sort by timepoint to ensure proper ordering
+df_long = df_long.sort_values(by='Timepoint')
+
+# Create a list to store log-rank test results
+results_list = []
+
+# Define significance stars based on p-value
+def significance_stars(p_value):
+    if p_value < 0.0001:
+        return "****"
+    elif p_value < 0.001:
+        return "***"
+    elif p_value < 0.01:
+        return "**"
+    elif p_value < 0.05:
+        return "*"
+    else:
+        return ""
+
+# Define a function to perform Kaplan-Meier fitting and log-rank test
+def perform_logrank_test(T1, E1, T2, E2, label1, label2):
+    results = logrank_test(T1, T2, event_observed_A=E1, event_observed_B=E2)
+    raw_p_value = results.p_value
+    results_list.append({
+        'Group 1': label1,
+        'Group 2': label2,
+        'Test': 'Kaplan-Meyer survival analysis log-rank test',
+        'Post-hoc test': 'Benjamini-Hochberg False Discovery Rate',
+        'Raw p-value': raw_p_value,
+        'Corrected p-value': None,
+        'Significance': significance_stars(raw_p_value)
+    })
+
+    print(f"{label1} vs {label2}:")
+    results.print_summary()
+    print(f"p-value: {results.p_value}")
+    print(f"Test Statistic: {results.test_statistic}")
+
+# Get the list of timepoints in order
+timepoints = list(retr.columns)
+
+# Compare adjacent pairs (1 vs 2, 3 vs 4, etc.)
+for i in range(0, len(timepoints) - 1, 2):
+    tp1 = timepoints[i]
+    tp2 = timepoints[i + 1]
+
+    T1 = df_long[df_long['Timepoint'] == tp1]['Retrieval']
+    E1 = df_long[df_long['Timepoint'] == tp1]['Event']
+    T2 = df_long[df_long['Timepoint'] == tp2]['Retrieval']
+    E2 = df_long[df_long['Timepoint'] == tp2]['Event']
+
+    perform_logrank_test(T1, E1, T2, E2, tp1, tp2)
+
+# Convert results list to DataFrame
+results_df = pd.DataFrame(results_list)
+
+# Extract the raw p-values for correction
+raw_p_values = results_df['Raw p-value'].values
+
+# Apply Benjamini-Hochberg FDR correction
+rejected, corrected_p_values, _, _ = multipletests(raw_p_values, method='fdr_bh')
+
+# Update corrected p-values
+results_df['Corrected p-value'] = corrected_p_values
+
+# Update significance stars
+results_df['Significance'] = results_df['Corrected p-value'].apply(significance_stars)
+
+# Save log-rank results to CSV
+output_file = file_path.replace(".csv", "_results.csv")
+results_df.to_csv(output_file, index=False)
+
+print(f"\nResults saved to: {output_file}")
