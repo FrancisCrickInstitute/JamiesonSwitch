@@ -1,1 +1,1 @@
-# JamiesonSwitch
+This repository contains analysis code for the project '** Overnight   circuit remodelling drives juvenile alloparental care ** ' by Bradley B. Jamieson, Maxwell X. Chen, Swang Liang, Lina S. H. El Rasheed, Grace M. K. Chattey and Johannes Kohl
