@@ -1,0 +1,125 @@
+import pandas as pd
+import scipy.stats as stats
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+from statsmodels.stats.multicomp import MultiComparison
+import scikit_posthocs as sp
+import pingouin as pg
+
+# User-defined variables
+file_path = "FILEPATH.csv"  # Path to your data file
+control_column = "CONTROL"  # Name of the control column (make sure it matches exactly)
+paired = False  # Set to True if you want a paired test, False otherwise
+
+def significance_stars(p_value):
+    """Assign stars based on p-value thresholds."""
+    if p_value < 0.0001:
+        return "****"
+    elif p_value < 0.001:
+        return "***"
+    elif p_value < 0.01:
+        return "**"
+    elif p_value < 0.05:
+        return "*"
+    else:
+        return ""
+
+def perform_anova(file_path, control_column, paired=False):
+    # Load the data
+    print(f"Loading data from: {file_path}")
+    df = pd.read_csv(file_path, header=0)  # Read data with first row as headers
+    df = df.apply(pd.to_numeric, errors='coerce')  # Convert all entries to numeric (non-numeric -> NaN)
+
+    # Filter to keep only relevant columns (e.g., "P14", "P15", etc.)
+    df = df[[col for col in df.columns if col.startswith("P")]]
+    print(f"Columns used for analysis: {list(df.columns)}")
+
+    # Show a preview of the data
+    print("Preview of loaded data:")
+    print(df.head())
+
+    # Melt data for analysis
+    melted_df = df.melt(var_name='Group', value_name='Value').dropna()
+    print(f"Data melted for analysis. Total data points: {melted_df.shape[0]}")
+
+    # Ensure at least 3 valid values exist before normality testing
+    valid_columns = [col for col in df.columns if df[col].dropna().shape[0] >= 3]
+    if not valid_columns:
+        raise ValueError("None of the columns have at least 3 values for normality testing.")
+
+    # Perform normality test only on valid columns
+    normality_pvals = {col: stats.shapiro(df[col].dropna())[1] for col in valid_columns}
+    normal = all(p > 0.05 for p in normality_pvals.values())
+    print(f"Normality test results: {normality_pvals}\nData distribution is {'normal' if normal else 'not normal'}")
+
+    # Check if control column exists in filtered data
+    if control_column not in df.columns:
+        raise ValueError(f"Control column '{control_column}' not found in data.")
+
+    # Filter the groups to compare only the control vs. others
+    comparison_groups = [col for col in df.columns if col != control_column]
+
+    # Prepare result storage
+    results_list = []
+
+    # Perform ANOVA if normal, else Kruskal-Wallis test
+    for group in comparison_groups:
+        print(f"\nPerforming comparison: {control_column} vs {group}")
+        
+        # Prepare melted data for this specific comparison
+        comparison_df = melted_df[melted_df['Group'].isin([control_column, group])].dropna()
+
+        # Check normality for the two groups involved
+        if normal:
+            print("Performing ANOVA test...")
+            model = smf.ols('Value ~ C(Group)', data=comparison_df).fit()
+            anova_table = sm.stats.anova_lm(model, typ=2)
+            test_name = "ANOVA"
+            p_value = anova_table["PR(>F)"].values[0]
+            posthoc_test = "Dunnett's"
+            posthoc_results = pg.pairwise_ttests(dv='Value', between='Group', data=comparison_df, padjust='dunnett')
+            corrected_p_value = posthoc_results['p-unc'].values[0]
+        else:
+            print("Performing Kruskal-Wallis test...")
+            test_name = "Kruskal-Wallis"
+            ctrl_values = comparison_df[comparison_df['Group'] == control_column]['Value']
+            group_values = comparison_df[comparison_df['Group'] == group]['Value']
+            _, p_value = stats.kruskal(ctrl_values, group_values)
+            posthoc_test = "Dunn’s (Holm correction)"
+            posthoc_results = sp.posthoc_dunn([ctrl_values, group_values], p_adjust='holm')
+            corrected_p_value = posthoc_results.iloc[0, 1]  # Adjust if needed based on matrix structure
+
+        print(f"{test_name} test completed. p-value: {p_value}")
+        print(f"Performing {posthoc_test} post-hoc test...")
+
+        # Add stars for significance
+        significance = significance_stars(p_value)
+
+        # Append the results to the list
+        results_list.append({
+            'Group 1': control_column,
+            'Group 2': group,
+            'Parametric': normal,
+            'Test Used': test_name,
+            'Posthoc Test': posthoc_test,
+            'Raw p-value': p_value,
+            'Corrected p-value': corrected_p_value,
+            'Significance': significance
+        })
+
+    # Convert results to DataFrame
+    results_df = pd.DataFrame(results_list)
+
+    # Save results to a CSV file
+    output_file = file_path.replace(".csv", "_results.csv")
+    results_df.to_csv(output_file, index=False)
+    print(f"\nResults saved to: {output_file}")
+
+    return results_df
+
+# Run the analysis and get results in DataFrame format
+results_df = perform_anova(file_path, control_column, paired)
+
+# Print results
+print("\nFinal Results:")
+print(results_df)
