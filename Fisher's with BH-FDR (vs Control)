@@ -1,0 +1,92 @@
+import pandas as pd
+from scipy.stats import fisher_exact
+from statsmodels.stats.multitest import multipletests
+
+def significance_stars(p_value):
+    """Assign stars based on p-value thresholds."""
+    if p_value < 0.0001:
+        return "****"
+    elif p_value < 0.001:
+        return "***"
+    elif p_value < 0.01:
+        return "**"
+    elif p_value < 0.05:
+        return "*"
+    else:
+        return ""
+
+# This code performs Fisher's Exact Test to compare each group to a specified control group in the dataset.
+# It then applies a post-hoc correction method for multiple comparisons and outputs the results to a .csv file.
+
+# User-defined variables
+file_path = "FILEPATH.csv"  # Path to your data file
+control_column = "CONTROL"  # Name of the control column (make sure it matches exactly and is the LAST column)
+
+def perform_fishers_test(file_path, control_column):
+    # Load the data, making sure the first column is used as the row index
+    print(f"Loading data from: {file_path}")
+    df = pd.read_csv(file_path, header=0, index_col=0)  # Set the first column as the row index
+    df = df.apply(pd.to_numeric, errors='coerce')  # Convert to numeric
+    df = df.dropna()  # Drop NaNs
+    print(f"Data loaded. Remaining rows: {df.shape[0]}\nColumns: {list(df.columns)}")
+
+    # Check if control column exists
+    if control_column not in df.columns:
+        raise ValueError(f"Control column '{control_column}' not found in data.")
+
+    # Make sure that 'In' and 'Out' labels are in the correct row. 
+    # Assuming 'In' and 'Out' are values in the index:
+    row_labels = df.index.tolist()
+
+    if 'In' not in row_labels or 'Out' not in row_labels:
+        raise KeyError("'In' and/or 'Out' are missing in the row labels.")
+
+    # Initialize the results list
+    results_list = []
+
+    # Perform Fisher's Exact Test comparing each group to the control group
+    for column in df.columns[:-1]:  # Exclude the last column ('Vir.')
+        # Create a 2x2 contingency table for the group vs control
+        table = [
+            [df.at['In', control_column], df.at['Out', control_column]],
+            [df.at['In', column], df.at['Out', column]]
+        ]
+
+        # Perform Fisher's Exact Test
+        _, p_value = fisher_exact(table)
+
+        # Correct p-value using Benjamini-Hochberg method
+        p_values = [p_value]  # Single p-value for this comparison
+        corrected_p_values = multipletests(p_values, method='fdr_bh')[1]
+        corrected_p_value = corrected_p_values[0]
+
+        # Add results to the list
+        results_list.append({
+            'Group 1': control_column,
+            'Group 2': column,
+            'Test': 'Fisher\'s Exact Test',
+            'Post-hoc test': 'Benjamini-Hochberg False Discovery Rate',
+            'Raw p-value': p_value,
+            'Corrected p-value': corrected_p_value,
+            'Significance': significance_stars(corrected_p_value)
+        })
+
+    # Convert results to a DataFrame
+    results_df = pd.DataFrame(results_list)
+
+    # Reorder columns
+    results_df = results_df[['Group 1', 'Group 2', 'Test', 'Post-hoc test', 'Raw p-value', 'Corrected p-value', 'Significance']]
+
+    # Save results to a CSV file
+    output_file = "FILEPATH_results.csv"  # Specify the output file path
+    results_df.to_csv(output_file, index=False)
+
+    print(f"\nResults saved to {output_file}")
+    return results_df
+
+# Run the analysis and get results in DataFrame format
+results_df = perform_fishers_test(file_path, control_column)
+
+# Print results
+print("\nFinal Results:")
+print(results_df)
