@@ -1,0 +1,92 @@
+import pandas as pd
+from scipy.stats import fisher_exact
+from statsmodels.stats.multitest import multipletests
+
+def significance_stars(p_value):
+    """Assign stars based on p-value thresholds."""
+    if p_value < 0.0001:
+        return "****"
+    elif p_value < 0.001:
+        return "***"
+    elif p_value < 0.01:
+        return "**"
+    elif p_value < 0.05:
+        return "*"
+    else:
+        return ""
+
+# User-defined variables
+file_path = "FILEPATH.csv"  # Path to your data file
+
+def perform_fishers_test(file_path):
+    # Load the data, making sure the first column is used as the row index
+    print(f"Loading data from: {file_path}")
+    df = pd.read_csv(file_path, header=0, index_col=0)  # Set the first column as the row index
+    df = df.apply(pd.to_numeric, errors='coerce')  # Convert to numeric
+    df = df.dropna()  # Drop NaNs
+    print(f"Data loaded. Remaining rows: {df.shape[0]}\nColumns: {list(df.columns)}")
+
+    # Ensure 'In' and 'Out' labels are in the index
+    row_labels = df.index.tolist()
+    if 'In' not in row_labels or 'Out' not in row_labels:
+        raise KeyError("'In' and/or 'Out' are missing in the row labels.")
+
+    # Initialize results list and p-value list for multiple testing correction
+    results_list = []
+    p_values = []
+    column_pairs = []
+
+    columns = list(df.columns)
+
+    # Perform Fisher's Exact Test for adjacent column pairs
+    for i in range(0, len(columns) - 1, 2):  # Step by 2
+        col1 = columns[i]
+        col2 = columns[i + 1]
+
+        # Create a 2x2 contingency table
+        table = [
+            [df.at['In', col1], df.at['Out', col1]],
+            [df.at['In', col2], df.at['Out', col2]]
+        ]
+
+        # Perform Fisher's Exact Test
+        _, p_value = fisher_exact(table)
+
+        # Store the p-value and column pair for later correction
+        p_values.append(p_value)
+        column_pairs.append((col1, col2))
+
+    # Apply Benjamini-Hochberg FDR correction
+    corrected_p_values = multipletests(p_values, method='fdr_bh')[1]
+
+    # Store results with corrected p-values
+    for (col1, col2), raw_p, corrected_p in zip(column_pairs, p_values, corrected_p_values):
+        results_list.append({
+            'Group 1': col1,
+            'Group 2': col2,
+            'Test': 'Fisher\'s Exact Test',
+            'Post-hoc test': 'Benjamini-Hochberg False Discovery Rate',
+            'Raw p-value': raw_p,
+            'Corrected p-value': corrected_p,
+            'Significance': significance_stars(corrected_p)
+        })
+
+    # Convert results to a DataFrame
+    results_df = pd.DataFrame(results_list)
+
+    # Reorder columns
+    results_df = results_df[['Group 1', 'Group 2', 'Test', 'Post-hoc test', 'Raw p-value', 'Corrected p-value', 'Significance']]
+
+    # Save results to a CSV file
+    output_file = "FILEPATH_results.csv"  # Specify the output file path
+    results_df.to_csv(output_file, index=False)
+
+    print(f"\nResults saved to {output_file}")
+    return results_df
+
+# Run the analysis and get results in DataFrame format
+results_df = perform_fishers_test(file_path)
+
+# Print results
+print("\nFinal Results:")
+print(results_df)
