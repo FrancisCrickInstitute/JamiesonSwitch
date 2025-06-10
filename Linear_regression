@@ -1,0 +1,60 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+from scipy import stats
+
+# Read data from CSV file
+data = pd.read_csv('FIELPATH.csv')
+
+# Extract X and Y values
+X = data.iloc[1:, 1].astype(float)  # Assuming data starts from row 2 (index 1)
+Y = data.iloc[1:, 2].astype(float)
+
+# Add a constant to the X values for the intercept in the linear model
+X_with_intercept = sm.add_constant(X)
+
+# Perform linear regression using OLS (Ordinary Least Squares)
+model = sm.OLS(Y, X_with_intercept).fit()
+
+# Get regression results
+slope = model.params[1]
+intercept = model.params[0]
+r_squared = model.rsquared
+p_value = model.pvalues[1]
+
+# Calculate the predicted values (fitted line)
+Y_pred = model.predict(X_with_intercept)
+
+# Calculate the residuals (errors)
+residuals = Y - Y_pred
+
+# Calculate the standard error of the residuals
+se_residuals = np.std(residuals)
+
+# Calculate the 90% confidence interval
+ci_upper = Y_pred + 1.645 * se_residuals
+ci_lower = Y_pred - 1.645 * se_residuals
+
+# Plot the data with the fitted line and 90% CI error bars
+plt.figure(figsize=(8, 6))
+plt.scatter(X, Y, label='Data points', color='blue')
+plt.plot(X, Y_pred, label='Fitted line', color='red', linewidth=2)
+plt.fill_between(X, ci_lower, ci_upper, color='gray', alpha=0.3, label='90% CI')
+plt.xlabel(data.columns[1])  # X-axis label
+plt.ylabel(data.columns[2])  # Y-axis label
+plt.title('Linear Regression with 90% Confidence Interval')
+plt.legend()
+
+# Show the plot
+plt.show()
+
+# Save results to a CSV file
+results = pd.DataFrame({
+    'Equation': [f"Y = {intercept:.4f} + {slope:.4f}*X"],
+    'R-squared': [r_squared],
+    'P-value': [p_value]
+})
+
+# Save to a CSV file
+results.to_csv('FILEPATH_results.csv', index=False)
