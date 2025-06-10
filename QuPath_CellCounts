@@ -1,0 +1,101 @@
+import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+import os
+import glob
+
+def main():
+    # Load summary CSV file
+    file_path = '/path/to/your/data/Cellfinder_results/SUBJECT-ID/analysis/QUPATHOUTPUT_summary.csv'
+    df = pd.read_csv(file_path)
+
+    # Structures to exclude from analysis
+    structures_to_remove = [
+        'alveus', 'amygdalar capsule', 'anterior commissure, olfactory limb', 'anterior commissure, temporal limb',
+        'arbor vitae', 'auditory radiation', 'brachium of the inferior colliculus', 'brachium of the superior colliculus',
+        'cerebal peduncle', 'cerebellar commissure', 'Cerebellum', 'cerebral aqueduct', 'choroid plexus',
+        'cingulum bundle', 'columns of the fornix', 'commissural branch of stria terminalis',
+        'corpus callosum, anterior forceps', 'corpus callosum, body', 'corpus callosum, extreme capsule',
+        'corpus callosum, posterior forceps', 'corpus callosum, splenium', 'Cortical subplate',
+        'corticospinal tract', 'crossed tectospinal pathway', 'cuneate fascicle', 'dorsal spinocerebellar tract',
+        'direct tectospinal pathway', 'doral tegmental decussation', 'dorsal acoustic stria', 'dorsal fornix',
+        'dorsal hippocampal commissure', 'dorsal limb', 'external capsule', 'external medullary lamina of the thalamus',
+        'facial nerve', 'fasciculus retroflexus', 'fiber tracts', 'fimbria', 'fourth ventricle',
+        'genu of corpus callosum', 'genu of the facial nerve', 'habenular commissure', 'Hippocampal formation',
+        'Hypothalamus', 'inferior cerebellar peduncle', 'inferior colliculus commissure', 'internal capsule',
+        'lateral lemniscus', 'lateral olfactory tract, body', 'lateral recess', 'lateral ventricle',
+        'mammillary peduncle', 'mammillotegmental tract', 'mammillothalamic tract',
+        'medial corticohypothalamic tract', 'medial forebrain bundle', 'medial lemniscus', 'medial longitudinal fascicle',
+        'Medulla', 'Midbrain', 'middle cerebellar peduncle', 'motor root of the trigeminal nerve', 'nigrostriatal tract',
+        'oculomotor nerve', 'olfactory nerve layer of main olfactory bulb', 'optic chiasm', 'optic nerve',
+        'optic radiation', 'optic tract', 'Pallidum', 'Parasubiculum', 'Pons', 'posterior commissure',
+        'Postsubiculum', 'Presubiculum', 'principal mammillary tract', 'Prosubiculum', 'pyramid',
+        'pyramidal decussation', 'root', 'rubrospinal tract', 'sensory root of the trigeminal nerve', 'solitary tract',
+        'spinal tract of the trigeminal nerve', 'stria medullaris', 'stria terminalis', 'striatum',
+        'subependymal zone', 'subiculum', 'subpallidum', 'superior cerebelar peduncles',
+        'superior cerebellar peduncle decussation', 'superior colliculus commissure',
+        'supra-callosal cerebral white matter', 'supraoptic commissures', 'Thalamus', 'third ventricle',
+        'trapezoid body', 'trochlear nerve', 'uncinate fascicle', 'ventral hippocampal commissure',
+        'ventral spinocerebellar tract', 'ventral tegmental decussation', 'vestibular nerve', 'vomeronasal nerve',
+        'Gigantocellular reticular nucleus'
+    ]
+
+    # Regions of interest and MPOA grouping
+    list_of_areas = [
+        'Agranular insular area', 'Anterior area', 'Anterior cingulate area', 'Anterolateral visual area',
+        'Anteromedial visual area', 'Basolateral amygdalar nucleus', 'Central amygdalar nucleus',
+        'Cortical amygdalar area', 'Dentate gyrus', 'Dorsal auditory area',
+        'Dorsal part of the lateral geniculate complex', 'Ectorhinal area', 'Entorhinal area', 'Frontal pole',
+        'Gustatory areas', 'Infralimbic area', 'Lateral septal nucleus', 'Lateral visual area',
+        'Laterointermediate area', 'Medial geniculate complex', 'Medial mammillary nucleus',
+        'Nucleus of the lateral olfactory tract', 'Orbital area', 'Paraventricular hypothalamic nucleus',
+        'Perirhinal area', 'Periventricular hypothalamic nucleus', 'Posterior auditory area',
+        'Posterolateral visual area', 'posteromedial visual area', 'Postrhinal area', 'Prelimbic area',
+        'Primary auditory area', 'Primary motor area', 'Primary somatosensory area', 'Primary visual area',
+        'Retrosplenial area', 'Rostrolateral area', 'Secondary motor area', 'Superior colliculus',
+        'Temporal association areas', 'Ventral auditory area', 'Visceral area'
+    ]
+
+    list_of_MPOA = [
+        'Medial preoptic nucleus', 'Medial preoptic area', 'Parastrial nucleus',
+        'Anterodorsal preoptic nucleus', 'Posterodorsal preoptic nucleus'
+    ]
+
+    def remove_structures(df, remove_list):
+        return df[~df['structure_name'].isin(remove_list)]
+
+    def structure_simplified(df, areas, mpoa_regions):
+        df['structure_name'] = df['structure_name'].str.replace('/', ',')
+        df['split_structure'] = df['structure_name'].str.split(',').str[0]
+
+        grouped = df[df['split_structure'].isin(areas)].groupby('split_structure').sum().reset_index()
+        remaining = df.loc[~df.index.isin(grouped.index)].copy()
+        remaining['split_structure'] = remaining['structure_name']
+
+        df = pd.concat([grouped, remaining])
+        df.drop(columns='structure_name', inplace=True)
+        df.rename(columns={'split_structure': 'structure_name'}, inplace=True)
+        df['Cells per mm^3'] = df['total_cells'] / df['total_volume_mm3']
+        df.replace(np.inf, 0, inplace=True)
+
+        if 'MPOA' not in df['structure_name'].values:
+            mpoa_data = df[df['structure_name'].isin(mpoa_regions)].sum()
+            mpoa_data['structure_name'] = 'MPOA'
+            df = df[~df['structure_name'].isin(mpoa_regions)]
+            df = df.append(mpoa_data, ignore_index=True)
+
+        df.sort_values(by='Cells per mm^3', ascending=False, inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df[['structure_name', 'total_cells', 'total_volume_mm3', 'Cells per mm^3']]
+
+    # Run cleaning and transformation
+    df = remove_structures(df, structures_to_remove)
+    df = structure_simplified(df, list_of_areas, list_of_MPOA)
+
+    # Save cleaned data
+    output_path = '/path/to/your/data/Cellfinder_results/SUBJECT-ID/analysis/QUPATHOUTPUT_summary_clean.xlsx'
+    df.to_excel(output_path, index=False)
+    print(df)
+
+if __name__ == "__main__":
+    main()
