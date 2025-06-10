@@ -1,0 +1,125 @@
+import os
+import pandas as pd
+import numpy as np
+import umap
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.decomposition import PCA
+from scipy.spatial.distance import cdist, pdist
+from itertools import combinations
+
+# Set the directory
+data_dir = "/FILEPATH"
+
+# Load datasets
+data_list, file_names_list, id_list = [], [], []
+for file_name in os.listdir(data_dir):
+    if file_name.endswith(".csv"):
+        file_path = os.path.join(data_dir, file_name)
+        data = pd.read_csv(file_path).dropna()
+        ids = data.iloc[:, 0]
+        id_list.extend(ids)
+        data = data.drop(data.columns[0], axis=1)
+        data_list.append(data)
+        file_names_list.extend([file_name] * len(data))
+
+# Combine datasets
+all_data = pd.concat(data_list, ignore_index=True)
+all_data['SourceFile'] = file_names_list
+all_data['ID'] = id_list
+all_data['Cluster'] = all_data['ID'].astype(str).str[:2]
+
+# Perform PCA
+pca = PCA(n_components=2)
+features = all_data.drop(['SourceFile', 'Cluster', 'ID'], axis=1)
+pca_result = pca.fit_transform(features)
+print(f"PCA result shape: {pca_result.shape}")
+
+# UMAP setup
+n_neighbors = min(15, pca_result.shape[0] - 1)
+print(f"Using n_neighbors={n_neighbors}")
+umap_result = umap.UMAP(n_components=2, n_neighbors=n_neighbors, random_state=42).fit_transform(pca_result)
+
+# Combine into DataFrame
+pca_df = pd.DataFrame(pca_result, columns=['PC1', 'PC2'])
+umap_df = pd.DataFrame(umap_result, columns=['UMAP1', 'UMAP2'])
+final_df = pd.concat([pd.Series(id_list, name='ID'), all_data, pca_df, umap_df], axis=1)
+
+# Cluster centers
+pca_cluster_centers = final_df.groupby('Cluster')[['PC1', 'PC2']].mean()
+print("\nPCA coordinates of the cluster centers:")
+print(pca_cluster_centers)
+
+# Pairwise distances
+distance_df = pd.DataFrame(
+    cdist(pca_cluster_centers, pca_cluster_centers, metric='euclidean'),
+    index=pca_cluster_centers.index, columns=pca_cluster_centers.index
+)
+print("\nPairwise Euclidean distances between cluster centers:")
+print(distance_df)
+
+# Permutation test
+n_permutations = 1000
+observed_distances = pdist(pca_cluster_centers, metric='euclidean')
+cluster_pairs = list(combinations(pca_cluster_centers.index, 2))
+null_distributions = {pair: [] for pair in cluster_pairs}
+
+for _ in range(n_permutations):
+    shuffled_data = np.apply_along_axis(np.random.permutation, 0, features.values)
+    shuffled_pca = pca.transform(pd.DataFrame(shuffled_data, columns=features.columns))
+    shuffled_df = pd.DataFrame(shuffled_pca, columns=['PC1', 'PC2'])
+    shuffled_df['Cluster'] = final_df['Cluster'].values
+    shuffled_centers = shuffled_df.groupby('Cluster')[['PC1', 'PC2']].mean()
+    shuffled_distances = pdist(shuffled_centers, metric='euclidean')
+    for i, pair in enumerate(cluster_pairs):
+        null_distributions[pair].append(shuffled_distances[i])
+
+# Average and SEM of shuffled distances
+avg_shuffled = {pair: np.mean(vals) for pair, vals in null_distributions.items()}
+sem_shuffled = {pair: np.std(vals, ddof=1) / np.sqrt(n_permutations) for pair, vals in null_distributions.items()}
+
+# P-values
+p_values = {
+    pair: np.mean(np.array(null_distributions[pair]) >= observed_distances[i])
+    for i, pair in enumerate(cluster_pairs)
+}
+
+print("\nPermutation Test for Differences in Cluster Distances:")
+for pair, p in p_values.items():
+    print(f"Cluster {pair[0]} vs Cluster {pair[1]}: p-value = {p:.4f}")
+
+print("\nAverage Pairwise Euclidean Distances Between Shuffled Cluster Centers:")
+for pair in cluster_pairs:
+    print(f"{pair[0]} vs {pair[1]}: {avg_shuffled[pair]:.4f} ± {sem_shuffled[pair]:.4f}")
+
+# Save shuffled distances to CSV
+shuffled_df = pd.DataFrame(null_distributions)
+shuffled_df.to_csv("/Users/jamiesb/Desktop/RET_PCA_shuffled_distances.csv", index=False)
+
+# Save final data
+final_df.to_csv("FILEPATH_results.csv", index=False)
+print("\nResults saved")
+
+# UMAP plot
+plt.figure(figsize=(10, 8))
+for cluster in final_df['Cluster'].unique():
+    cluster_data = final_df[final_df['Cluster'] == cluster]
+    plt.scatter(cluster_data['UMAP1'], cluster_data['UMAP2'], label=f'Cluster {cluster}')
+plt.scatter(pca_cluster_centers['PC1'], pca_cluster_centers['PC2'], c='black', s=100, alpha=0.7, marker='X', label='Cluster Centers')
+plt.xlabel('UMAP Component 1')
+plt.ylabel('UMAP Component 2')
+plt.title('UMAP Visualization of Clusters')
+plt.legend()
+plt.show()
+
+# Plot actual vs shuffled distributions
+for i, pair in enumerate(cluster_pairs):
+    plt.figure(figsize=(8, 4))
+    sns.histplot(null_distributions[pair], bins=30, kde=True, color='lightblue')
+    plt.axvline(observed_distances[i], color='red', linestyle='--', label='Observed Distance')
+    plt.title(f'Distance: Cluster {pair[0]} vs Cluster {pair[1]}')
+    plt.xlabel('Euclidean Distance')
+    plt.ylabel('Frequency')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
