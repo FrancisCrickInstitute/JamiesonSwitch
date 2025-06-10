@@ -1,0 +1,50 @@
+import pandas as pd
+
+# Load the CSV file
+file_path = 'FILEPATH_summary.csv'
+df = pd.read_csv(file_path)
+
+# Define brain regions to exclude
+exclude_regions = [
+    'alveus', 'amygdalar capsule', 'anterior commissure, olfactory limb', 'anterior commissure, temporal limb',
+    'arbor vitae', 'auditory radiation', 'brachium of the inferior colliculus', 'brachium of the superior colliculus',
+    'cerebal peduncle', 'cerebellar commissure', 'Cerebellum', 'cerebral aqueduct', 'choroid plexus',
+    'cingulum bundle', 'columns of the fornix', 'commissural branch of stria terminalis',
+    'corpus callosum, anterior forceps', 'corpus callosum, body', 'corpus callosum, extreme capsule',
+    'corpus callosum, posterior forceps', 'corpus callosum, splenium', 'Cortical subplate',
+    'corticospinal tract', 'crossed tectospinal pathway', 'cuneate fascicle', 'dorsal spinocerebellar tract',
+    'direct tectospinal pathway', 'doral tegmental decussation', 'dorsal acoustic stria', 'dorsal fornix',
+    'dorsal hippocampal commissure', 'dorsal limb', 'external capsule', 'external medullary lamina of the thalamus',
+    'facial nerve', 'fasciculus retroflexus', 'fiber tracts', 'fimbria', 'fourth ventricle',
+    'genu of corpus callosum', 'genu of the facial nerve', 'habenular commissure', 'Hippocampal formation',
+    'Hypothalamus', 'inferior cerebellar peduncle', 'inferior colliculus commissure', 'internal capsule',
+    'lateral lemniscus', 'lateral olfactory tract, body', 'lateral recess', 'lateral ventricle',
+    'mammillary peduncle', 'mammillotegmental tract', 'mammillothalamic tract', 'medial corticohypothalamic tract',
+    'medial forebrain bundle', 'medial lemniscus', 'medial longitudinal fascicle', 'Medulla', 'Midbrain',
+    'middle cerebellar peduncle', 'motor root of the trigeminal nerve', 'nigrostriatal tract', 'oculomotor nerve',
+    'olfactory nerve layer of main olfactory bulb', 'optic chiasm', 'optic nerve', 'optic radiation', 'optic tract',
+    'Pallidum', 'Parasubiculum', 'Pons', 'posterior commissure', 'Postsubiculum', 'Presubiculum',
+    'principal mammillary tract', 'Prosubiculum', 'pyramid', 'pyramidal decussation', 'root', 'rubrospinal tract',
+    'sensory root of the trigeminal nerve', 'solitary tract', 'spinal tract of the trigeminal nerve',
+    'stria medullaris', 'stria terminalis', 'striatum', 'subependymal zone', 'subiculum', 'subpallidum',
+    'superior cerebelar peduncles', 'superior cerebellar peduncle decussation', 'superior colliculus commissure',
+    'supra-callosal cerebral white matter', 'supraoptic commissures', 'Thalamus', 'third ventricle',
+    'trapezoid body', 'trochlear nerve', 'uncinate fascicle', 'ventral hippocampal commissure',
+    'ventral spinocerebellar tract', 'ventral tegmental decussation', 'vestibular nerve', 'vomeronasal nerve'
+]
+
+# Filter out excluded regions
+df = df[~df['structure_name'].isin(exclude_regions)]
+
+# Compute cell density
+df['Cells per mm^3'] = df['total_cells'] / df['total_volume_mm3']
+
+# Group and summarize the data
+summary = df.groupby('structure_name')[['total_cells', 'Cells per mm^3']].sum()
+
+# Save the output to Excel
+output_path = 'FILEPATH_Organised.xlsx'
+summary.to_excel(output_path)
+
+# Optional: print result
+print(summary)
