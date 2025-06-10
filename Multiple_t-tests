@@ -1,0 +1,122 @@
+import pandas as pd
+import scipy.stats as stats
+import scikit_posthocs as sp
+import statsmodels.stats.multitest as smm
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
+
+# === USER CONFIGURATION ===
+file_path = "FILEPATH.csv"
+paired = True  # Set to True for paired (within-subject) comparisons
+
+# === UTILITY FUNCTION ===
+def significance_stars(p):
+    if p < 0.0001:
+        return "****"
+    elif p < 0.001:
+        return "***"
+    elif p < 0.01:
+        return "**"
+    elif p < 0.05:
+        return "*"
+    else:
+        return ""
+
+# === MAIN FUNCTION ===
+def perform_t_tests(file_path, paired=True):
+    print(f"Loading data from: {file_path}")
+    df = pd.read_csv(file_path, header=0)
+    df.columns = df.columns.str.strip()
+    df = df.apply(pd.to_numeric, errors='coerce').dropna()
+    print(f"Data loaded. Remaining rows: {df.shape[0]}\nColumns: {list(df.columns)}")
+
+    # Normality test
+    valid_columns = [col for col in df.columns if df[col].dropna().shape[0] >= 3]
+    if not valid_columns:
+        raise ValueError("No columns with at least 3 valid values.")
+    normality_pvals = {col: stats.shapiro(df[col].dropna())[1] for col in valid_columns}
+    normal = all(p > 0.05 for p in normality_pvals.values())
+    print(f"Normality test results: {normality_pvals}")
+    print(f"Data distribution is {'normal' if normal else 'not normal'}")
+
+    results_list = []
+    all_p_values = []
+
+    for i in range(0, len(df.columns), 2):
+        col1, col2 = df.columns[i], df.columns[i + 1]
+        group1, group2 = df[col1], df[col2]
+        print(f"\nComparing: {col1} vs {col2}")
+
+        if normal:
+            if paired:
+                print("Performing paired t-test...")
+                stat, p_value = stats.ttest_rel(group1, group2)
+                test_name = "Paired t-test"
+                posthoc_test = "Benjamini-Hochberg FDR"
+                all_p_values.append(p_value)
+                corrected_p_value = p_value  # Placeholder
+            else:
+                print("Performing unpaired t-test...")
+                stat, p_value = stats.ttest_ind(group1, group2)
+                test_name = "Unpaired t-test"
+                posthoc_test = "Tukey's HSD"
+                melted = df[[col1, col2]].melt(var_name='Group', value_name='Value')
+                tukey = pairwise_tukeyhsd(melted['Value'], melted['Group'])
+                tukey_df = pd.DataFrame(data=tukey.summary().data[1:], columns=tukey.summary().data[0])
+                match = tukey_df[
+                    ((tukey_df['group1'] == col1) & (tukey_df['group2'] == col2)) |
+                    ((tukey_df['group1'] == col2) & (tukey_df['group2'] == col1))
+                ]
+                corrected_p_value = match['p-adj'].values[0] if not match.empty else p_value
+        else:
+            if paired:
+                print("Performing Wilcoxon signed-rank test...")
+                try:
+                    stat, p_value = stats.wilcoxon(group1, group2)
+                except ValueError:
+                    p_value = 1.0
+                test_name = "Wilcoxon signed-rank test"
+                posthoc_test = "Benjamini-Hochberg FDR"
+                all_p_values.append(p_value)
+                corrected_p_value = p_value  # Placeholder
+            else:
+                print("Performing Mann-Whitney U test...")
+                stat, p_value = stats.mannwhitneyu(group1, group2, alternative='two-sided')
+                test_name = "Mann-Whitney U test"
+                posthoc_test = "Dunn's (Benjamini-Hochberg FDR)"
+                melted = df[[col1, col2]].melt(var_name='Group', value_name='Value')
+                try:
+                    dunn_results = sp.posthoc_dunn(melted, val_col='Value', group_col='Group', p_adjust='fdr_bh')
+                    corrected_p_value = dunn_results.loc[col1, col2]
+                except Exception:
+                    corrected_p_value = p_value
+
+        stars = significance_stars(corrected_p_value)
+        results_list.append({
+            'Group 1': col1,
+            'Group 2': col2,
+            'Parametric': normal,
+            'Test Used': test_name,
+            'Posthoc Test': posthoc_test,
+            'Raw p-value': p_value,
+            'Corrected p-value': corrected_p_value,
+            'Significance': stars
+        })
+
+    # Apply FDR correction to paired comparisons
+    if paired and all_p_values:
+        print("Applying Benjamini-Hochberg FDR correction across paired tests...")
+        corrected = smm.multipletests(all_p_values, method='fdr_bh')[1]
+        for i, new_p in enumerate(corrected):
+            results_list[i]['Corrected p-value'] = new_p
+            results_list[i]['Significance'] = significance_stars(new_p)
+
+    results_df = pd.DataFrame(results_list)
+    output_file = file_path.replace(".csv", "_results.csv")
+    results_df.to_csv(output_file, index=False)
+    print(f"\nResults saved to: {output_file}")
+    return results_df
+
+# === RUN ===
+results_df = perform_t_tests(file_path, paired=paired)
+print("\nFinal Results:")
+print(results_df)
