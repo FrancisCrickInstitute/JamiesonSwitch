@@ -1,0 +1,63 @@
+import numpy as np
+import pandas as pd
+from scipy.optimize import curve_fit
+from scipy.stats import linregress
+
+# Load 470 nm photometry data
+raw_470 = pd.read_csv("FILEPATH_470.csv", header=None).drop([0])
+fibre1_470 = pd.DataFrame(raw_470[8].dropna()).reset_index(drop=True)
+fibre2_470 = pd.DataFrame(raw_470[9].dropna()).reset_index(drop=True)
+
+# Load 415 nm photometry data
+raw_415 = pd.read_csv("FILEPATH_415.csv", header=None).drop([0])
+fibre1_415 = pd.DataFrame(raw_415[8].dropna()).reset_index(drop=True)
+fibre2_415 = pd.DataFrame(raw_415[9].dropna()).reset_index(drop=True)
+
+# Load 470 background data
+background_470 = pd.read_csv("FILEPATH_470_BACKGROUND.csv", header=None).drop([0])
+background_f1_470 = pd.to_numeric(background_470[8], errors='coerce').median()
+background_f2_470 = pd.to_numeric(background_470[9], errors='coerce').median()
+
+# Load time from camera metadata (convert to seconds, assuming 30 fps)
+raw_camera = pd.read_csv("FILEPATH_CAMERA.csv", header=None)
+time = raw_470[0].drop([0]).reset_index(drop=True).astype(float) / 30
+
+# Clip photometry data to max of 1
+fibre1_470[1] = np.minimum(fibre1_470[1], 1)
+fibre2_470[1] = np.minimum(fibre2_470[1], 1)
+fibre1_415[1] = np.minimum(fibre1_415[1], 1)
+fibre2_415[1] = np.minimum(fibre2_415[1], 1)
+
+# Background subtraction (Ca-dependent signal)
+calcium_f1 = fibre1_470[1] - background_f1_470
+calcium_f2 = fibre2_470[1] - background_f2_470
+
+# Isosbestic signals
+isos_f1 = fibre1_415[1]
+isos_f2 = fibre2_415[1]
+
+# Bi-exponential fit function
+def biexp(x, a, b, c, d):
+    return a * np.exp(c * x) + b * np.exp(d * x)
+
+# Fit biexponential to isosbestic signals
+popt_f1, _ = curve_fit(biexp, time, isos_f1, maxfev=500000)
+popt_f2, _ = curve_fit(biexp, time, isos_f2, maxfev=500000)
+
+# Fit scaled isosbestic to calcium signal
+slope_f1, intercept_f1, *_ = linregress(biexp(time, *popt_f1), calcium_f1)
+slope_f2, intercept_f2, *_ = linregress(biexp(time, *popt_f2), calcium_f2)
+
+# Fitted baseline signal
+fitted_f1 = slope_f1 * biexp(time, *popt_f1) + intercept_f1
+fitted_f2 = slope_f2 * biexp(time, *popt_f2) + intercept_f2
+
+# Detrended fluorescence signals
+signal_f1 = calcium_f1 - fitted_f1 + calcium_f1.min()
+signal_f2 = calcium_f2 - fitted_f2 + calcium_f1.min()  # using f1 min for consistency
+
+# Export signal (optional)
+signal_f1.to_excel("FILENAME_F1.xlsx")
+# signal_f2.to_excel("FILENAME_F2.xlsx")
+
+print("DONE")
