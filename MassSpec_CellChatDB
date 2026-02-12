@@ -1,0 +1,119 @@
+library(CellChat)
+library(limma)
+
+setwd("/camp/home/davise/home/shared/davise/mat_instinct_analysis/final_paper/")
+
+# GET CELL CHAT DATA
+data("CellChatDB.mouse")
+
+# GET P15 v P14 HYP-SPECIFIC PROTEINS
+hyp_spec <- dplyr::filter(as.data.frame(fread("data/P15vP14_HYP_SPEC_DEs.csv")),
+                          FDR < 0.05, abs(log2FC) > 1)$proteins
+
+hyp_spec_interactions <- dplyr::filter(CellChatDB.mouse$interaction,
+                                       ligand.symbol %in% hyp_spec)
+
+
+# ~~~~~~~~~~~~~~~~~~ BOX PLOTS SPECIFIC PROTEINS ~~~~~~~~~~~~~~~~~~~~
+
+# PLOT Gas6 BARS
+data <- as.data.frame(fread("data/all_regions.csv"))
+meta <- as.data.frame(fread("data/all_regions_meta.csv"))
+
+region_levels <- c("CTX","HYP","STR")
+age_levels    <- c("P10","P14","P15")
+age_region_levels <- c("CTX_P10","CTX_P14","CTX_P15","HYP_P10","HYP_P14",
+                       "HYP_P15","STR_P10","STR_P14","STR_P15")
+
+gas6_long <- data %>%
+  dplyr::filter(str_detect(V1, regex("^Gas6($|;)", ignore_case = FALSE))) %>%
+  pivot_longer(cols = -V1, names_to = "ID", values_to = "expr") %>%
+  left_join(meta, by = "ID") %>%
+  mutate(
+    age = factor(age, levels = age_levels),
+    region = factor(region, levels = region_levels),
+    age_region = factor(paste(region, age, sep = "_"), levels = age_region_levels)
+  )
+
+pdf(file="figures/Gas6_boxplots.pdf",width = 5, height = 5)
+ggplot(gas6_long, aes(x = age_region, y = expr)) +
+  geom_boxplot(outlier.shape = NA, width = 0.6) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.7, size = 2) +
+  labs(x = "Region_Age", y = "Gas6", title = "Gas6 by region-age group") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top"
+  )
+dev.off()
+
+
+# PLOT Sema4a BARS
+sema4a_long <- data %>%
+  dplyr::filter(str_detect(V1, regex("^Sema4a($|;)", ignore_case = FALSE))) %>%
+  pivot_longer(cols = -V1, names_to = "ID", values_to = "expr") %>%
+  left_join(meta, by = "ID") %>%
+  mutate(
+    age = factor(age, levels = age_levels),
+    region = factor(region, levels = region_levels),
+    age_region = factor(paste(region, age, sep = "_"), levels = age_region_levels)
+  )
+
+pdf(file="figures/Sema4a_boxplots.pdf",width = 5, height = 5)
+ggplot(sema4a_long, aes(x = age_region, y = expr)) +
+  geom_boxplot(outlier.shape = NA, width = 0.6) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.7, size = 2) +
+  labs(x = "Region_Age", y = "Sema4a", title = "Sema4a by region-age group") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top"
+  )
+dev.off()
+
+# PLOT Sema5a BARS
+sema5a_long <- data %>%
+  dplyr::filter(str_detect(V1, regex("^Sema5a($|;)", ignore_case = FALSE))) %>%
+  pivot_longer(cols = -V1, names_to = "ID", values_to = "expr") %>%
+  left_join(meta, by = "ID") %>%
+  mutate(
+    age = factor(age, levels = age_levels),
+    region = factor(region, levels = region_levels),
+    age_region = factor(paste(region, age, sep = "_"), levels = age_region_levels)
+  )
+
+pdf(file="figures/Sema5a_boxplots.pdf",width = 5, height = 5)
+ggplot(sema5a_long, aes(x = age_region, y = expr)) +
+  geom_boxplot(outlier.shape = NA, width = 0.6) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.7, size = 2) +
+  labs(x = "Region_Age", y = "Sema5a", title = "Sema5a by region-age group") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top"
+  )
+dev.off()
+
+
+# PLOT Ptprd BARS
+ptprd_long <- data %>%
+  dplyr::filter(str_detect(V1, regex("^Ptprd($|;)", ignore_case = FALSE))) %>%
+  pivot_longer(cols = -V1, names_to = "ID", values_to = "expr") %>%
+  left_join(meta, by = "ID") %>%
+  mutate(
+    age = factor(age, levels = age_levels),
+    region = factor(region, levels = region_levels),
+    age_region = factor(paste(region, age, sep = "_"), levels = age_region_levels)
+  )
+
+pdf(file="figures/Ptprd_boxplots.pdf",width = 5, height = 5)
+ggplot(ptprd_long, aes(x = age_region, y = expr)) +
+  geom_boxplot(outlier.shape = NA, width = 0.6) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.7, size = 2) +
+  labs(x = "Region_Age", y = "Ptprd", title = "Ptprd by region-age group") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top"
+  )
+dev.off()
