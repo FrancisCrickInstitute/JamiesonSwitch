@@ -1,0 +1,164 @@
+import pandas as pd
+import numpy as np
+from math import sqrt
+from itertools import combinations
+from scipy import stats
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
+from statsmodels.stats.multitest import multipletests
+
+# === USER CONFIGURATION ===
+# Change this path for each gene file
+file_path = "FILEPATH.csv"
+
+
+def significance_stars(p):
+    if p < 0.0001:
+        return "****"
+    elif p < 0.001:
+        return "***"
+    elif p < 0.01:
+        return "**"
+    elif p < 0.05:
+        return "*"
+    else:
+        return ""
+
+
+def two_way_age_region_anova_bh(file_path):
+    print(f"Loading data from: {file_path}")
+    df = pd.read_csv(file_path, header=0)
+    df.columns = df.columns.str.strip()
+
+    # Ensure numeric data; non-numeric entries become NaN
+    df = df.apply(pd.to_numeric, errors="coerce")
+
+    # ----- RESHAPE TO LONG FORMAT WITH Region & Age -----
+    # Expect column names like "Region_Age" (e.g., "MOs/p_P14")
+    df_long = df.melt(var_name="Group", value_name="Value").dropna()
+
+    # Split "Group" into Region and Age by the last underscore
+    region_age = df_long["Group"].str.rsplit("_", n=1, expand=True)
+    df_long["Region"] = region_age[0]
+    df_long["Age"] = region_age[1]
+
+    # Sanity check
+    print("\nDetected factor levels:")
+    print("Regions:", df_long["Region"].unique())
+    print("Ages:", df_long["Age"].unique())
+
+    # ----- TWO-WAY ANOVA: Value ~ Region * Age -----
+    model = ols("Value ~ C(Region) * C(Age)", data=df_long).fit()
+    anova_table = sm.stats.anova_lm(model, typ=2)  # typ=2 = common for balanced-ish designs
+
+    print("\n=== Two-way ANOVA (Region, Age, Region*Age) ===")
+    print(anova_table)
+
+    # Pooled within-group variance and df from residual
+    MS_within = anova_table.loc["Residual", "sum_sq"] / anova_table.loc["Residual", "df"]
+    df_within = int(anova_table.loc["Residual", "df"])
+    print(f"\nPooled MS_within = {MS_within:.4f}, DF_within = {df_within}")
+
+    # ----- POST-HOC: AGE COMPARISONS WITHIN EACH REGION (Prism-style) -----
+    results = []
+    raw_pvals = []
+
+    regions = sorted(df_long["Region"].unique())
+    ages = sorted(df_long["Age"].unique())
+
+    print("\n=== Pairwise Age comparisons within each Region (using pooled MS_within) ===")
+
+    for region in regions:
+        # Data for this region
+        sub = df_long[df_long["Region"] == region]
+
+        # Means and ns by Age within this Region
+        grouped = sub.groupby("Age")["Value"]
+        means = grouped.mean()
+        ns = grouped.count()
+
+        # All combinations of Ages present in this region
+        region_ages = list(means.index)
+        for age1, age2 in combinations(region_ages, 2):
+            mean1, mean2 = means[age1], means[age2]
+            n1, n2 = ns[age1], ns[age2]
+
+            mean_diff = mean1 - mean2
+            se_diff = sqrt(MS_within * (1.0 / n1 + 1.0 / n2))
+            t_val = mean_diff / se_diff
+            p_val = 2 * stats.t.sf(abs(t_val), df=df_within)
+
+            raw_pvals.append(p_val)
+
+            res = {
+                "Region": region,
+                "Age 1": age1,
+                "Age 2": age2,
+                "Mean 1": mean1,
+                "Mean 2": mean2,
+                "Mean diff (Age1 - Age2)": mean_diff,
+                "SE of diff": se_diff,
+                "n1": n1,
+                "n2": n2,
+                "t": t_val,
+                "DF (from ANOVA residual)": df_within,
+                "Individual P value": p_val,
+            }
+            results.append(res)
+
+            print(
+                f"{region}: {age1} vs {age2} -> "
+                f"mean diff = {mean_diff:.4f}, t = {t_val:.3f}, p = {p_val:.4g}"
+            )
+
+    # ----- BENJAMINI–HOCHBERG FDR ACROSS THESE TESTS -----
+    print("\nApplying Benjamini–Hochberg FDR (fdr_bh) to Age-within-Region comparisons...")
+    if raw_pvals:
+        _, q_vals, _, _ = multipletests(raw_pvals, method="fdr_bh")
+
+        for res, q in zip(results, q_vals):
+            res["q value"] = q
+            res["Discovery? (q<0.05)"] = "Yes" if q < 0.05 else "No"
+            res["Significance (q)"] = significance_stars(q)
+
+    results_df = pd.DataFrame(results)
+
+    # Order columns nicely
+    results_df = results_df[
+        [
+            "Region",
+            "Age 1",
+            "Age 2",
+            "Mean 1",
+            "Mean 2",
+            "Mean diff (Age1 - Age2)",
+            "SE of diff",
+            "n1",
+            "n2",
+            "t",
+            "DF (from ANOVA residual)",
+            "Individual P value",
+            "q value",
+            "Discovery? (q<0.05)",
+            "Significance (q)",
+        ]
+    ]
+
+    # ----- SAVE -----
+    anova_out = file_path.replace(".csv", "_TWO_WAY_AGE_REGION_ANOVA.csv")
+    mc_out = file_path.replace(".csv", "_AgeWithinRegion_BH_FDR.csv")
+
+    anova_table.to_csv(anova_out)
+    results_df.to_csv(mc_out, index=False)
+
+    print(f"\nANOVA table saved to: {anova_out}")
+    print(f"Age-within-region multiple comparisons (BH FDR) saved to: {mc_out}")
+
+    return anova_table, results_df
+
+
+# === RUN ===
+if __name__ == "__main__":
+    anova_table, mc_df = two_way_age_region_anova_bh(file_path)
+    print("\n=== Age-within-Region multiple comparisons (BH FDR) ===")
+    print(mc_df)
