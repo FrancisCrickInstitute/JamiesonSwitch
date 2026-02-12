@@ -1,0 +1,202 @@
+import pandas as pd
+import numpy as np
+from sklearn.metrics import roc_auc_score
+from sklearn.utils import resample
+from scipy.stats import wilcoxon
+from statsmodels.stats.multitest import multipletests
+import itertools
+
+# === Load data ===
+file_path = "/FILEPATH"  # Update as needed
+df = pd.read_csv(file_path)
+
+# === Melt to long format ===
+df_long = df.melt(var_name='stimulus', value_name='zscore').dropna()
+
+stimuli = df_long['stimulus'].unique()
+n_bootstrap = 1000
+rng = np.random.default_rng(42)
+
+print(f"\nLoaded data from: {file_path}")
+print(f"\nComputing one-vs-rest ROC AUC with bootstrapping ({n_bootstrap} resamples)...\n")
+
+# === ROC AUC Bootstrapping ===
+bootstrap_aucs = {}
+auc_results = []
+
+for stim in stimuli:
+    df_temp = df_long.copy()
+    df_temp['label'] = (df_temp['stimulus'] == stim).astype(int)
+
+    y_true = df_temp['label']
+    y_score = df_temp['zscore']
+    mask = ~y_score.isna()
+    y_true = y_true[mask]
+    y_score = y_score[mask]
+
+    if len(np.unique(y_true)) < 2:
+        print(f"{stim}: skipped (only one class present)")
+        continue
+
+    aucs = []
+    for _ in range(n_bootstrap):
+        idx = rng.integers(0, len(y_true), size=len(y_true))
+        if len(np.unique(y_true.iloc[idx])) < 2:
+            continue
+        auc = roc_auc_score(y_true.iloc[idx], y_score.iloc[idx])
+        aucs.append(auc)
+
+    mean_auc = np.mean(aucs)
+    sem_auc = np.std(aucs) / np.sqrt(len(aucs))
+    bootstrap_aucs[stim] = aucs
+    print(f"{stim}: bootstrap ROC AUC mean={mean_auc:.3f}, sem={sem_auc:.3f}")
+    auc_results.append({'stimulus': stim, 'roc_auc': mean_auc, 'roc_auc_sem': sem_auc})
+
+# === Pairwise AUC Comparison ===
+print("\nPairwise bootstrap ROC AUC comparison: P(stimA > stimB)")
+comparison_matrix = pd.DataFrame(index=stimuli, columns=stimuli)
+
+for stimA, stimB in itertools.product(stimuli, repeat=2):
+    aucA = bootstrap_aucs.get(stimA, [])
+    aucB = bootstrap_aucs.get(stimB, [])
+    if not aucA or not aucB:
+        comparison_matrix.loc[stimA, stimB] = np.nan
+        continue
+    min_len = min(len(aucA), len(aucB))
+    prob = np.mean(np.array(aucA[:min_len]) > np.array(aucB[:min_len]))
+    comparison_matrix.loc[stimA, stimB] = prob
+
+# === Rank by ROC AUC ===
+auc_df = pd.DataFrame(auc_results).sort_values('roc_auc', ascending=False)
+
+# === Dominance Summary ===
+dominance_summary = []
+for stim in stimuli:
+    if stim not in bootstrap_aucs:
+        continue
+    probs = comparison_matrix.loc[stim].dropna().astype(float)
+    dominance_count = (probs > 0.95).sum()
+    dominance_avg = probs.mean()
+    dominance_summary.append({
+        'stimulus': stim,
+        'dominance_count_0.95': dominance_count,
+        'dominance_avg_prob': dominance_avg
+    })
+dominance_df = pd.DataFrame(dominance_summary).sort_values('dominance_avg_prob', ascending=False)
+
+# === Tuning Specificity Index (TSI) with Wilcoxon & Correction ===
+def tuning_specificity_index(resp_stim, resp_others):
+    mean_stim = np.mean(resp_stim)
+    mean_others = np.mean(resp_others)
+    sd_stim = np.std(resp_stim, ddof=1)
+    sd_others = np.std(resp_others, ddof=1)
+    pooled_sd = np.sqrt((sd_stim ** 2 + sd_others ** 2) / 2)
+    if pooled_sd == 0:
+        return np.nan
+    return (mean_stim - mean_others) / pooled_sd
+
+tuning_results = []
+p_values_wilcoxon = []
+bootstrap_distributions = {}
+
+for stim in stimuli:
+    resp_stim = df_long[df_long['stimulus'] == stim]['zscore'].dropna().values
+    resp_others = df_long[df_long['stimulus'] != stim]['zscore'].dropna().values
+
+    if len(resp_stim) == 0 or len(resp_others) == 0:
+        print(f"{stim}: insufficient data for tuning specificity")
+        continue
+
+    tsi = tuning_specificity_index(resp_stim, resp_others)
+
+    tuning_bootstrap = []
+    for _ in range(n_bootstrap):
+        stim_sample = resample(resp_stim, n_samples=len(resp_stim), random_state=rng.integers(1e6))
+        other_sample = resample(resp_others, n_samples=len(resp_others), random_state=rng.integers(1e6))
+        tsi_boot = tuning_specificity_index(stim_sample, other_sample)
+        tuning_bootstrap.append(tsi_boot)
+
+    tuning_bootstrap = np.array(tuning_bootstrap)
+    bootstrap_distributions[stim] = tuning_bootstrap
+
+    # p-value from bootstrap (for reference)
+    p_value_bootstrap = np.mean(tuning_bootstrap <= 0)
+
+    # Wilcoxon signed-rank test against 0
+    try:
+        stat, p_wilcoxon = wilcoxon(tuning_bootstrap, alternative='greater')
+    except ValueError:
+        p_wilcoxon = np.nan
+    p_values_wilcoxon.append(p_wilcoxon)
+
+    tsi_sem = np.std(tuning_bootstrap, ddof=1) / np.sqrt(len(tuning_bootstrap))
+    tsi_sd = np.std(tuning_bootstrap, ddof=1)
+    ci_lower = np.percentile(tuning_bootstrap, 2.5)
+    ci_upper = np.percentile(tuning_bootstrap, 97.5)
+
+    tuning_results.append({
+        'stimulus': stim,
+        'tuning_specificity_index': tsi,
+        'tuning_specificity_sem': tsi_sem,
+        'tuning_specificity_sd': tsi_sd,
+        'tuning_specificity_ci_lower': ci_lower,
+        'tuning_specificity_ci_upper': ci_upper,
+        'p_value_bootstrap': p_value_bootstrap,
+        'p_value_wilcoxon': p_wilcoxon  # adjusted below
+    })
+
+# === Adjust Wilcoxon p-values ===
+pvals = np.array(p_values_wilcoxon)
+reject, pvals_corrected, _, _ = multipletests(pvals, alpha=0.05, method='fdr_bh')
+
+# Add corrected p-values and significance stars
+for i, result in enumerate(tuning_results):
+    result['p_value_corrected'] = pvals_corrected[i]
+    if pvals_corrected[i] < 0.001:
+        result['significance'] = '***'
+    elif pvals_corrected[i] < 0.01:
+        result['significance'] = '**'
+    elif pvals_corrected[i] < 0.05:
+        result['significance'] = '*'
+    else:
+        result['significance'] = 'ns'
+
+tuning_df = pd.DataFrame(tuning_results).sort_values('tuning_specificity_index', ascending=False)
+
+# === Per-animal TSI (unchanged) ===
+def compute_rowwise_tsi(df):
+    tsi_matrix = []
+    for idx, row in df.iterrows():
+        row_tsi = {}
+        for stim in row.index:
+            stim_val = row[stim]
+            others = row.drop(stim).dropna().values
+            if pd.isna(stim_val) or len(others) == 0:
+                tsi = np.nan
+            else:
+                mean_others = np.mean(others)
+                sd_others = np.std(others, ddof=1) if len(others) > 1 else 0
+                pooled_sd = np.sqrt(sd_others**2 / 2)
+                tsi = (stim_val - mean_others) / pooled_sd if pooled_sd != 0 else np.nan
+            row_tsi[stim] = tsi
+        tsi_matrix.append(row_tsi)
+    return pd.DataFrame(tsi_matrix)
+
+tsi_per_stim_per_animal = compute_rowwise_tsi(df)
+
+# === Export results ===
+output_file = file_path.replace(".csv", "_results.csv")
+with open(output_file, "w") as f:
+    f.write("ROC AUC Summary\n")
+    auc_df.to_csv(f, index=False)
+    f.write("\n\nStimulus Dominance Summary\n")
+    dominance_df.to_csv(f, index=False)
+    f.write("\n\nPairwise Comparison Matrix (P[stimA > stimB])\n")
+    comparison_matrix.to_csv(f)
+    f.write("\n\nTuning Specificity Results\n")
+    tuning_df.to_csv(f, index=False)
+    f.write("\n\nTSI Per Animal Per Stimulus\n")
+    tsi_per_stim_per_animal.to_csv(f, index=False)
+
+print(tuning_df)
+print(f"\nResults saved to: {output_file}")
