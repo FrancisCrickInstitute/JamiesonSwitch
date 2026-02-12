@@ -1,0 +1,257 @@
+# IMPORT LIBRARIES
+library(tidyverse)
+library(limma)
+library(data.table)
+library(WGCNA)
+library(fgsea)
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads()
+
+
+setwd("/camp/home/davise/home/shared/davise/mat_instinct_analysis/")
+
+# IMPORT DATA
+all_norm_intensities <- as.data.frame(fread("data/all_regions.csv"))
+all_meta <- as.data.frame(fread("data/all_regions_meta.csv"))
+rownames(all_meta) <- all_meta$ID
+
+# MAKE ROWNAMES UNIQUE (FOR DUPLICATE PROTEINS, KEEP HIGHEST ABUNDANCE ONE)
+all_norm_intensities$avg_intensity <- rowMeans(all_norm_intensities[ , -1], na.rm = TRUE)
+
+all_norm_intensities <- all_norm_intensities %>%
+  dplyr::filter(V1 != '') %>% group_by(V1) %>%
+  slice_max(order_by = avg_intensity, n = 1, with_ties = FALSE) %>% 
+  ungroup()
+all_norm_intensities <- as.data.frame(all_norm_intensities)
+
+rownames(all_norm_intensities) <- all_norm_intensities$V1
+all_norm_intensities$V1 <- NULL
+all_norm_intensities$avg_intensity <- NULL
+
+all_norm_intensities[all_norm_intensities == 0] <- NA
+expr <- as.matrix(all_norm_intensities)
+
+
+
+######################### RUN WGCNA ################################
+
+# CLEAN DATA
+expr <- expr[, intersect(colnames(expr), rownames(all_meta)), drop = FALSE]
+all_meta <- all_meta[colnames(expr), , drop = FALSE]
+
+# FILTER OUT LOW EXPRESSING PROTEINS
+keep_genes <- rowMeans(is.finite(expr)) >= 0.7
+expr <- expr[keep_genes, , drop = FALSE]
+
+# SCALE DATA TO BETTER COMPARE ACROSS REGIONS
+#expr <- t(scale(t(expr), center = TRUE, scale = FALSE))
+datExpr <- t(expr)
+
+# QC TO DROP BAD PROTEINS/SAMPLES
+gsg <- goodSamplesGenes(datExpr, verbose = 3)
+if (!gsg$allOK) {
+  datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes, drop = FALSE]
+  meta    <- meta[rownames(datExpr), , drop = FALSE]
+}
+
+# CHOOSE SOFT POWER
+powers <- 1:26
+sft <- pickSoftThreshold(datExpr, networkType = "signed", corFnc = "bicor",
+                         corOptions = "use = 'pairwise.complete.obs'",
+                         powerVector = powers, verbose = 5)
+softPower <- 21
+
+# RUN WGCNA TO BUILD NETWORK
+net <- blockwiseModules(datExpr, power = softPower, corType = "bicor",
+                        networkType = "signed", TOMType = "signed",
+                        minModuleSize = 50, reassignThreshold = 0,
+                        mergeCutHeight = 0.45, pamRespectsDendro = FALSE,
+                        saveTOMs = FALSE, verbose = 3)
+
+moduleColors <- labels2colors(net$colors)
+
+# GET GENE-MODULE ASSIGNMENTS TO SAVE AS DF
+module_df <- data.frame(
+  gene   = names(net$colors),
+  color  = as.character(net$colors),
+  stringsAsFactors = FALSE
+)
+
+write.csv(module_df,file="data/WGCNA_gene_module_assignments.csv")
+
+
+
+########################## PLOT WGCNA ################################
+
+# GET MODULE EIGENGENES
+MEs <- orderMEs(net$MEs)
+
+# GET TRAIT DESIGN FROM META
+rownames(meta) <- meta$ID
+meta2 <- meta[rownames(MEs), , drop = FALSE]
+meta2 <- meta2 %>%
+  mutate(sex = factor(sex), region = factor(region),
+         age = factor(age, levels = c("P10","P14","P15")),
+         age_reg = factor(paste0(age,"_",region)))
+
+traits_mat <- model.matrix(~ 0 + age_reg, data = meta2)
+
+# DO BICOR BETWEEN MODULES AND TRAITS, CALCULATE P-VALUES
+bp <- WGCNA::bicorAndPvalue(MEs[,c(1:length(unique(moduleColors))-1)],
+                            traits_mat, use = "pairwise.complete.obs")
+corME <- bp$bicor
+pME   <- bp$p
+
+# BH-ADJUST P-VALUES
+pME_adj <- matrix(
+  p.adjust(as.vector(pME), method = "BH"),
+  nrow = nrow(pME), dimnames = dimnames(pME)
+)
+
+# EXPORT COR AND PADJ DATA BEHIND HEATMAP
+write.csv(pME, file="data/WGCNA_pME_bicor.csv")
+write.csv(pME_adj, file="data/WGCNA_pME_adjp.csv")
+
+
+# HEATMAP TEXT
+textMat <- matrix(
+  paste0(sprintf("%.2f", corME), "\n(",
+         ifelse(pME_adj < 1e-3,
+                formatC(pME_adj, format = "e", digits = 1),
+                paste0("q=", sprintf("%.3f", pME_adj))), ")"),
+  nrow = nrow(corME), dimnames = dimnames(corME)
+)
+
+# CLEAN UP FOR HEATMAP
+gene_ids <- colnames(datExpr)
+
+dist_modules <- dist(corME)
+tree_modules <- hclust(dist_modules, method = "average")
+order_modules <- tree_modules$order
+
+# REORDER MODULES BY CLUSTERING
+corME_ord    <- corME[order_modules, , drop = FALSE]
+textMat_ord  <- textMat[order_modules, , drop = FALSE]
+yLabs_ord    <- rownames(corME)[order_modules]
+
+
+pdf(file = "figures/WGCNA_heatmap.pdf", width = 10, height = 8)
+WGCNA::labeledHeatmap(
+  Matrix = corME,
+  xLabels = colnames(traits_mat),
+  yLabels = colnames(MEs)[c(1:13)],
+  ySymbols = colnames(MEs)[c(1:13)],
+  colors = WGCNA::blueWhiteRed(50),
+  textMatrix = textMat,
+  cex.text = 0.8,
+  zlim = c(-1, 1),
+  main = "Module–trait correlations (bicor)\nvalue (BH-adj p)"
+)
+dev.off()
+
+
+# ~~~~~~~~~~~~~ PLOT WGCNA MODULE FUNCT. ENRICHMENTS ~~~~~~~~~~~~~~
+
+indir   <- "data/WGCNA/"
+out_pdf <- file.path("figures/", "WGCNA_GO_barplots_3x3.pdf")
+
+# HELPER FUNCTION TO READ IN ALL MODULE FILES
+read_go_file <- function(f) {
+  header <- readr::read_lines(f, n_max = 1)
+  delim  <- if (str_count(header, "\t") > str_count(header, ",")) "\t" else ","
+  
+  df <- suppressMessages(
+    readr::read_delim(f, delim = delim, trim_ws = TRUE, show_col_types = FALSE)
+  )
+
+  names(df) <- make.names(names(df))
+  
+  fe_col  <- grep("fold.Enrichment", names(df), value = TRUE, ignore.case = TRUE)
+  fdr_col <- grep("FDR", names(df), value = TRUE, ignore.case = TRUE)
+  term_col <- names(df)[1]  # GO term is first column in your example
+  
+  if (length(fe_col) == 0) stop("Couldn't find fold enrichment column in: ", f)
+  if (length(fdr_col) == 0) stop("Couldn't find FDR column in: ", f)
+  
+  df2 <- df %>%
+    transmute(
+      term = .data[[term_col]],
+      fold_enrich = as.numeric(.data[[fe_col[1]]]),
+      fdr = as.numeric(.data[[fdr_col[1]]])
+    ) %>%
+    dplyr::filter(!is.na(fold_enrich)) %>%
+    mutate(
+      log2FE = log2(fold_enrich),
+      stars = case_when(
+        fdr < 0.001 ~ "***",
+        fdr < 0.01  ~ "**",
+        fdr < 0.05  ~ "*",
+        TRUE ~ ""
+      ),
+      # drop GO ID from labels for readability (optional)
+      term = str_remove(term, "\\s*\\(GO:\\d+\\)")
+    )
+  
+  df2
+}
+
+# FUNCITON TO MAKE PLOT PER MODULE FILE
+plot_go_module <- function(df, module_name, module_colour) {
+  rng <- max(abs(df$log2FE), na.rm = TRUE)
+  nudge <- 0.04 * rng
+  
+  ggplot(df, aes(x = reorder(term, log2FE), y = log2FE)) +
+    geom_col(fill = module_colour, width = 0.7) +
+    geom_text(
+      aes(label = stars, y = log2FE + nudge),
+      hjust = 0, size = 4, fontface = "bold"
+    ) +
+    coord_flip(clip = "off") +
+    labs(
+      title = module_name,
+      x = NULL,
+      y = "log2(Fold Enrichment)"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.text.y = element_text(size = 9),
+      panel.grid.major.y = element_blank(),
+      plot.margin = margin(5.5, 35, 5.5, 5.5)
+    )
+}
+
+# GET ALL MODULE FILES
+files <- list.files(
+  path = indir,
+  pattern = "_top_GO\\.csv$",
+  full.names = TRUE
+)
+
+stopifnot(length(files) > 0)
+
+# READ AND PLOT EACH MODULE
+plots <- purrr::map(files, function(f) {
+  module <- basename(f) %>%
+    str_remove("_top_GO\\.csv$")
+  
+  df <- read_go_file(f)
+  
+  plot_go_module(df, module_name = module, module_colour = module)
+})
+
+# ARRANGE MODULE PLOTS IN GRID AND EXPORT PDF
+n <- length(plots)
+ncol <- 3
+nrow <- ceiling(n / ncol)
+
+p_all <- wrap_plots(plots, ncol = ncol) +
+  plot_annotation(title = "Top GO terms per module")
+
+ggsave(
+  filename = out_pdf,
+  plot = p_all,
+  width  = ncol * 5.2,
+  height = nrow * 5.2,
+  device = cairo_pdf
+)
