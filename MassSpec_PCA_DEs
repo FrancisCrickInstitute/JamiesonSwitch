@@ -1,0 +1,197 @@
+library(ggplot2)
+library(ggrepel)
+
+
+setwd("/camp/home/davise/home/shared/davise/mat_instinct_analysis/final_paper/")
+
+
+# SET COLOUR PALETTE
+palette <- c('P15'='#7578FF','P14'='#FF7070','P10'='#1ed665')
+
+all_norm_intensities <- as.data.frame(fread("data/all_regions.csv"))
+all_meta <- as.data.frame(fread("data/all_regions_meta.csv"))
+
+# MAKE ROWNAMES UNIQUE (FOR DUPLICATE PROTEINS, KEEP HIGHEST ABUNDANCE ONE)
+all_norm_intensities$avg_intensity <- rowMeans(all_norm_intensities[ , -1], na.rm = TRUE)
+
+all_norm_intensities <- all_norm_intensities %>%
+  dplyr::filter(V1 != '') %>% group_by(V1) %>%
+  slice_max(order_by = avg_intensity, n = 1, with_ties = FALSE) %>% 
+  ungroup()
+all_norm_intensities <- as.data.frame(all_norm_intensities)
+
+rownames(all_norm_intensities) <- all_norm_intensities$V1
+all_norm_intensities$V1 <- NULL
+all_norm_intensities$avg_intensity <- NULL
+
+# READ IN WGCNA GENE-MODULE DATA
+WGCNA_df <- as.data.frame(fread("data/WGCNA_gene_module_assignments.csv"))
+
+
+############################ RUN PCAs ##################################
+
+# MAKE DATA INTO MATRIX
+mat <- as.matrix(all_norm_intensities[ ,grepl("HYP",colnames(all_norm_intensities))])
+
+# DROP NA ROWS
+mat <- mat[apply(mat, 1, function(x) all(is.finite(x))), , drop = FALSE]
+
+# CALCULATE PCA
+pc <- prcomp(t(mat), center = TRUE, scale. = TRUE)
+
+# GET EXPLAINED VARIANCE OF PCs
+var_exp <- (pc$sdev^2) / sum(pc$sdev^2) * 100
+lab_pc1 <- sprintf("PC1 (%.1f%%)", var_exp[1])
+lab_pc2 <- sprintf("PC2 (%.1f%%)", var_exp[2])
+
+# GET METADATA AND PLOT DATA
+scores <- merge(data.frame(ID = rownames(pc$x), PC1 = pc$x[,1], PC2 = pc$x[,2]),
+                all_meta, by='ID')
+
+# SCATTER PLOT OF HYP SAMPLES ACROSS ALL AGES
+p <- ggplot(scores, aes(PC1, PC2, color = age, label = ID)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = palette) +
+  stat_ellipse(type = "norm", level = 0.68, linewidth = 0.6, linetype = 2, show.legend = FALSE) +
+  geom_label_repel(size = 3, label.size = 0.25, label.r = unit(0.15, "lines"),
+                   label.padding = unit(0.15, "lines"),
+                   box.padding = unit(0.35, "lines"),
+                   point.padding = unit(0.5, "lines"), segment.color = "grey60",
+                   segment.size = 0.3, min.segment.length = 0, seed = 42,
+                   show.legend = FALSE) +
+  labs(x = lab_pc1, y = lab_pc2, color = "Group") +
+  theme_minimal(base_size = 12)
+
+pdf(file='figures/PCA.pdf', width = 6, height = 6)
+p
+dev.off()
+
+
+
+########################### RUN DEs ##################################
+
+# MAKE META DATA FACTORS
+all_meta$region <- factor(all_meta$region, levels=c("CTX","HYP","STR"))
+all_meta$age    <- factor(all_meta$age, levels=c("P10","P14","P15"))
+
+# DEFINE DESIGN MATRIX
+design <- model.matrix(~ 0 + region*age, all_meta)
+colnames(design) <- make.names(colnames(design))
+
+# FIT MODEL
+fit <- lmFit(all_norm_intensities, design)
+fit <- eBayes(fit)
+
+# DEFINE CONTRASTS
+contr <- makeContrasts(
+  CTX_P15vsP14 = ageP15 - ageP14,
+  HYP_P15vsP14 = (ageP15 - ageP14) + (regionHYP.ageP15 - regionHYP.ageP14),
+  STR_P15vsP14 = (ageP15 - ageP14) + (regionSTR.ageP15 - regionSTR.ageP14),
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, contr)
+fit2 <- eBayes(fit2)
+
+# MAKE CONTRASTS HYP-SPECFIC (TWO-WAY MODEL)
+contr2 <- makeContrasts(
+  HYP_specific = HYP_P15vsP14 - (CTX_P15vsP14 + STR_P15vsP14)/2,
+  CTX_specific = CTX_P15vsP14 - (HYP_P15vsP14 + STR_P15vsP14)/2,
+  STR_specific = STR_P15vsP14 - (CTX_P15vsP14 + HYP_P15vsP14)/2,
+  levels = contr
+)
+
+fit3 <- contrasts.fit(fit2, contr2)
+fit3 <- eBayes(fit3)
+
+# EXTRACT REGION-SPECIFIC DEPs
+hyp_spec <- topTable(fit3, coef="HYP_specific", number=Inf)
+write.csv(hyp_spec, file="data/P15vP14_HYP_SPEC_DEs.csv")
+
+ctx_spec <- topTable(fit3, coef="CTX_specific", number=Inf)
+write.csv(ctx_spec, file="data/P15vP14_CTX_SPEC_DEs.csv")
+
+str_spec <- topTable(fit3, coef="STR_specific", number=Inf)
+write.csv(str_spec, file="data/P15vP14_STR_SPEC_DEs.csv")
+
+
+# MODIFY DATA FOR VOLCANO PLOT
+df <- hyp_spec %>%
+  mutate(
+    neg_log_padj = -log10(adj.P.Val),
+    sig_thr = 1.30103,
+    # up/down flag for colour
+    direction = case_when(
+      logFC > 0 & neg_log_padj > sig_thr ~ "Up P15",
+      logFC <= 0 & neg_log_padj > sig_thr  ~ "Up P14",
+      neg_log_padj <= sig_thr ~ "N.S."
+    )
+  )
+df$proteins <- rownames(df)
+
+# MERGE WITH WGCNA DATA
+df <- merge(df, WGCNA_df, by.x = 'proteins', by.y = 'gene')
+df <- df %>% mutate(color = ifelse(color == 'black','navy',
+                                   ifelse(color == 'greenyellow','lime',color))) %>%
+  mutate(color = ifelse(direction == 'N.S.', 'grey',color))
+
+# GET LABELS FOR VOLCANO PLOT
+topN <- 25
+n_lab <- min(topN, nrow(df))
+
+label_set_pval <- df %>%
+  arrange(desc(neg_log_padj)) %>%
+  slice_head(n = n_lab) %>%
+  pull(proteins)
+
+label_set_logfc <- df %>%
+  dplyr::filter(neg_log_padj > sig_thr) %>%
+  arrange(desc(abs(logFC))) %>%
+  slice_head(n = n_lab) %>%
+  pull(proteins)
+
+label_set <-
+  unique(c(label_set_pval, label_set_logfc,
+           c('Gas6','C1qbp','Sema5a','Lamtor4')))[!unique(c(label_set_pval,label_set_logfc,
+                                                            c('Gas6','C1qbp'))) %in% c('ADGRF3;Pla2g4c')]
+
+df <- df %>%
+  mutate(label = ifelse(proteins %in% label_set, proteins, ""))
+
+# SET UP PALETTE
+pal <- c("Up P14" = "#FF7070", "Up P15" = "#7578FF", "N.S." = "#999999")
+pal_mods <- c('purple'='#8151A1','yellow'='#FEE000','turquoise'='#65C7C2',
+              'navy'='#2E2F88','tan'='#D2B48D','pink'='#F9BFCB',
+              'magenta'='#BE4E9D','blue'='#386CB5','green'='#65BC46',
+              'red'='#ED2224','salmon'='#F47F72','lime'='#BCD631',
+              'brown'='#A62B2A','grey'='#999999')
+
+# PLOT VOLCANO - NO MODULE COLOURS
+p <- ggplot(df, aes(x = logFC, y = neg_log_padj, color = direction)) +
+  geom_hline(yintercept = 1.30103, linetype = 2, linewidth = 0.4) +
+  geom_point(alpha = 0.7, size = 1.6) + xlim(c(-6,6)) + ylim(c(0,4)) +
+  geom_label_repel(aes(label = label), seed = 42, min.segment.length = 0,
+    box.padding = 0.3, point.padding = 0.25, label.size = 0.2, size = 5,
+    max.overlaps = 100, na.rm = TRUE, show.legend = FALSE) +
+  scale_color_manual(values = pal) +
+  labs(x = "log2FC", y = expression(-log[10](FDR)), color = NULL) +
+  theme_minimal(base_size = 12)
+
+pdf(file="figures/volcano_P15vP14_HYP.pdf", width = 8, height = 7)
+p
+dev.off()
+
+# PLOT VOLCANO - WITH MODULE COLOURS
+p <- ggplot(df, aes(x = logFC, y = neg_log_padj, color = color)) +
+  geom_hline(yintercept = 1.30103, linetype = 2, linewidth = 0.4) +
+  geom_point(alpha = 0.7, size = 1.6) +
+  geom_label_repel(aes(label = label), seed = 42, min.segment.length = 0,
+                   box.padding = 0.3, point.padding = 0.25, label.size = 0.2, size = 4,
+                   max.overlaps = Inf, na.rm = TRUE, show.legend = FALSE) +
+  scale_color_manual(values = pal_mods) +
+  labs(x = "log2FC", y = expression(-log[10](FDR)), color = NULL) +
+  theme_minimal(base_size = 12)
+
+pdf(file="figures/volcano_P15vP14_HYP_MODCOL.pdf", width = 8, height = 7)
+p
+dev.off()
