@@ -1,4 +1,4 @@
-This repository contains analysis code for the project '_Overnight circuit remodelling drives juvenile alloparental care_' by Bradley B. Jamieson, Maxwell X. Chen, Swang Liang, Lina S. H. El Rasheed, Patty Wai, Grace M. K. Chattey, Maria Voronkov, Emma Davis, J. Mark Skehel, I. Lorena Arancibia-Cárcamo, Molly Strom and Johannes Kohl
+This repository contains analysis code for the project '_Overnight circuit remodelling enables the onset of caregiving in juveniles_' by Bradley B. Jamieson, Maxwell X. Chen, Lina S. H. El Rasheed, Phoebe M. Claxton, Swang Liang, Patty Wai, Grace M. K. Chattey, Maria Voronkov, Emma Davis, J. Mark Skehel, I. Lorena Arancibia-Cárcamo, Molly Strom and Johannes Kohl
 
 **ANOVA_vsAll**
 Loads a CSV of group columns (e.g., P14, P15), reshapes to long format, and checks normality across groups (Shapiro–Wilk, ≥3 values). For every pair of groups it runs either parametric ANOVA + pairwise t-tests (Holm-corrected) or Kruskal–Wallis + Dunn post-hoc (Holm-corrected), then exports a *_results.csv with tests, p-values, and significance stars.
