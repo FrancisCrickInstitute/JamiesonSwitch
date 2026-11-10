@@ -18,6 +18,8 @@ Takes a stimulus-by-response CSV (columns = stimuli), computes one-vs-rest ROC A
 **Elbow_points**
 Loads and concatenates morphometric CSVs, keeps user-selected features, standardizes them, and fits K-means across K=1–10. Uses the curvature (“elbow”) of inertia to pick an optimal K, plots the elbow curve, and prints the chosen K.
 
+**EphysAnalysis** Reads electrophysiology ABF files and associated metadata to analyse resting membrane potential, spontaneous firing, IVCC responses, and rheobase ramps. Quantifies spike frequency, firing patterns (silent, sparse, tonic, irregular), action potential properties, input resistance, membrane time constant, sag, rebound, and adaptation. Exports per-cell summaries, individual spike measurements, and firing classifications to Excel.
+
 **Fisher's_multiple**
 Reads a 2×N In/Out count table and runs Fisher’s exact test on adjacent column pairs (1 vs 2, 3 vs 4, etc.). Applies BH-FDR across all tests, assigns significance stars, and saves a results CSV with raw and corrected p-values.
 
