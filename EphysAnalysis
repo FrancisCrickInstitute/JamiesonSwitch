@@ -1,0 +1,2059 @@
+#!/usr/bin/env python3
+"""ABF current-clamp analysis: I0, IVCC, and ramp/rheobase.
+
+Read mapping notes TXT and ABF files in INPUT_PATH. Export per-cell summaries,
+quality-control logs, I0 firing-pattern classification, IV curves, and first-AP
+waveforms to OUTPUT_PATH. PSC/voltage-clamp processing is intentionally excluded.
+
+Dependencies: numpy, pandas, scipy, pyabf, openpyxl.
+Classification thresholds are operational settings, not validated cell types.
+"""
+from __future__ import annotations
+
+# =========================
+# USER SETTINGS (EDIT THESE)
+# =========================
+INPUT_PATH  = "INPUTPATH"
+OUTPUT_PATH = "OUTPUTPATH"
+
+DV_DT_THRESH_IVCC_V_PER_S = 10.0   # IVCC AP detection threshold
+DV_DT_THRESH_I0_V_PER_S   = 10.0   # I0 AP detection threshold
+DV_DT_THRESH_RHEO_V_PER_S = 2.0    # Rheo/ramp AP detection threshold
+RHEO_MIN_AP_AMP_FROM_THRESH_MV = 15.0
+
+# IVCC expected steps
+IVCC_STEP_START_PA = -60.0
+IVCC_STEP_DELTA_PA = 10.0
+IVCC_STEP_END_PA   = 80.0
+
+IVCC_STEADY_WINDOW_S = 0.2
+IVCC_BASELINE_WINDOW_S = 0.5
+
+# IVCC fixed step timing window (seconds from sweep start)
+IVCC_STEP_WIN_START_S = 1.125
+IVCC_STEP_WIN_END_S   = 2.125
+
+# First-AP waveform snippet around PEAK (for export)
+AP_SNIP_PRE_MS  = 5.0
+AP_SNIP_POST_MS = 10.0
+
+# Local AP baseline window (same sweep, just before threshold)
+AP_LOCAL_BASELINE_PRE_MS = 2.0
+
+# AHP/ADP windows relative to PEAK (used for 1AP features)
+FAHP_WIN_MS = (0.5, 10.0)
+MAHP_WIN_MS = (10.0, 100.0)
+ADP_WIN_MS  = (5.0, 50.0)
+
+# Sag metrics (negative steps)
+SAG_EARLY_MS = (10.0, 110.0)
+SAG_STEADY_LAST_MS = 200.0
+REBOUND_WIN_MS = 200.0
+
+# FI slope range for IVCC
+FI_MIN_STEP_PA = 10.0
+FI_MAX_STEP_PA = 80.0
+
+# Membrane tau QC (small hyperpolarizing IVCC steps only)
+TAU_FIT_STEPS_PA = (-20.0, -10.0, -30.0)
+TAU_FIT_WINDOW_MS = 100.0
+TAU_MIN_DEFLECTION_MV = 2.0
+TAU_MIN_MS = 1.0
+TAU_MAX_MS = 500.0
+TAU_MIN_R2 = 0.80
+TAU_MAX_RMSE_MV = 2.0
+
+# I0 metrics
+FANO_BIN_S = 1.0
+RATE_STABILITY_BIN_S = 5.0
+RHYTHM_BIN_S = 0.005
+RHYTHM_PEAK_SEARCH_S = (0.05, 0.5)
+
+# Ramp / rheo extra metrics (FIXED ramp timing)
+RHEO_RAMP_START_S = 2.15
+RHEO_RAMP_END_S   = 7.15
+RHEO_RECORD_END_S = 10.0
+
+RHEO_BLOCK_MIN_SPIKES = 1                  # require at least this many ramp spikes before calling block
+RHEO_BLOCK_MIN_REMAINDER_S = 0.10          # last spike must occur at least this long before ramp ends
+RHEO_BLOCK_MIN_CURRENT_CONTINUE_PA = 1.0   # current must continue rising by at least this amount after last spike
+RHEO_BLOCK_POST_START_MS = 10.0            # start plateau Vm measurement this long after last spike peak
+RHEO_BLOCK_PLATEAU_MIN_MV = -40.0          # plateau Vm must remain at least this depolarized to call block
+
+
+# =========================
+# Imports
+# =========================
+import re
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import pyabf
+from scipy.optimize import curve_fit
+
+
+# =========================
+# Dual logging (console + file)
+# =========================
+class DualLogger:
+    def __init__(self, logfile: Path):
+        self.logfile = logfile
+        self.logfile.write_text("")  # clear
+
+    def log(self, msg: str) -> None:
+        print(msg, flush=True)
+        with self.logfile.open("a") as f:
+            f.write(msg + "\n")
+
+
+LOGGER: Optional[DualLogger] = None
+
+
+def log(msg: str) -> None:
+    assert LOGGER is not None
+    LOGGER.log(msg)
+
+
+# =========================
+# Utilities
+# =========================
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def nanmed(x) -> float:
+    x = np.asarray(x, float)
+    return float(np.nanmedian(x)) if x.size else np.nan
+
+
+def robust_median(x: np.ndarray) -> float:
+    return float(np.median(x.astype(float)))
+
+
+def get_fs(abf: pyabf.ABF) -> float:
+    return float(abf.dataRate)
+
+
+def dvdt_mV_per_ms(v_mV: np.ndarray, fs: float) -> np.ndarray:
+    dt = 1.0 / fs
+    dv = np.gradient(v_mV.astype(float), dt)   # mV/s
+    return dv / 1000.0                         # mV/ms == V/s numerically
+
+
+
+def infer_date_and_progid_from_abf_name(fname: str) -> Tuple[Optional[str], Optional[str], bool, bool]:
+    stem = Path(fname).stem
+    has_events = "events" in stem.lower()
+    m_exact = re.match(r"^(\d{4}_\d{2}_\d{2})_(\d{4})$", stem)
+    if m_exact:
+        return m_exact.group(1), m_exact.group(2), True, has_events
+    m_loose = re.search(r"(\d{4}_\d{2}_\d{2}).*?(\d{4})", stem)
+    if m_loose:
+        return m_loose.group(1), m_loose.group(2), False, has_events
+    return None, None, False, has_events
+
+
+def date_from_txt_filename(txt_path: Path) -> Optional[str]:
+    stem = txt_path.stem
+    m = re.match(r"^(\d{4})(\d{2})(\d{2})$", stem)
+    if m:
+        return f"{m.group(1)}_{m.group(2)}_{m.group(3)}"
+    m2 = re.match(r"^(\d{4}_\d{2}_\d{2})$", stem)
+    if m2:
+        return m2.group(1)
+    return None
+
+
+def idx_from_time(t: np.ndarray, time_s: float) -> int:
+    if t.size == 0:
+        return 0
+    i = int(np.searchsorted(t, time_s, side="left"))
+    return int(np.clip(i, 0, t.size - 1))
+
+
+# =========================
+# Per-cell vertical summary helpers
+# =========================
+def safe_sheet_name(name: str, max_len: int = 31) -> str:
+    bad = r'[:\\/?*\[\]]'
+    s = re.sub(bad, "_", str(name))
+    return s[:max_len]
+
+
+def make_vertical_summary_from_row(row: pd.Series) -> pd.DataFrame:
+    """
+    Convert one Summary_Wide row into a vertical table:
+    Metric | Run1 | Run2 | Run3 | Avg
+
+    Handles both:
+    1) classic *_Run1/_Run2/_Run3/_Avg columns
+    2) simplified wide summaries that only contain *_Avg or bare metric columns
+    """
+    meta_rows = []
+    for k, v in row.items():
+        if isinstance(k, str) and k.startswith("meta_") and pd.notna(v):
+            meta_rows.append({"Metric": k, "Run1": v, "Run2": np.nan, "Run3": np.nan, "Avg": np.nan})
+
+    metrics = {}
+    bare_metrics = {}
+
+    for k, v in row.items():
+        if not isinstance(k, str):
+            continue
+        if k in ("Date", "Cell"):
+            continue
+        if k.startswith("meta_"):
+            continue
+
+        m = re.match(r"^(.*)_(Run[123]|Avg)$", k)
+        if m:
+            base = m.group(1)
+            suffix = m.group(2)
+            metrics.setdefault(base, {})[suffix] = v
+        else:
+            bare_metrics[k] = v
+
+    out_rows = []
+    for base in sorted(metrics.keys()):
+        d = metrics[base]
+        out_rows.append({
+            "Metric": base,
+            "Run1": d.get("Run1", np.nan),
+            "Run2": d.get("Run2", np.nan),
+            "Run3": d.get("Run3", np.nan),
+            "Avg": d.get("Avg", np.nan),
+        })
+
+    for base in sorted(bare_metrics.keys()):
+        out_rows.append({
+            "Metric": base,
+            "Run1": np.nan,
+            "Run2": np.nan,
+            "Run3": np.nan,
+            "Avg": bare_metrics[base],
+        })
+
+    return pd.DataFrame(meta_rows + out_rows)
+
+
+# =========================
+# TXT parsing
+# =========================
+@dataclass
+class TxtCellBlock:
+    cell_label: str
+    header_lines: List[str]
+    prog_map: Dict[str, str]
+
+
+def find_mapping_txt(folder: Path) -> Optional[Path]:
+    txts = sorted(folder.glob("*.txt"))
+    if not txts:
+        return None
+    return max(txts, key=lambda p: p.stat().st_size)
+
+
+def parse_txt_cells_and_metadata(txt_path: Path) -> Tuple[Dict[str, str], List[TxtCellBlock], List[str]]:
+    lines = txt_path.read_text(errors="ignore").splitlines()
+    cell_pat = re.compile(r"^\s*Cell\s+(\d+)\b", re.IGNORECASE)
+    map_pat = re.compile(r"^\s*(\d{4})\s*[-=]\s*(.+?)\s*$")  # accepts "=" or "-"
+
+    global_header: List[str] = []
+    cells: List[TxtCellBlock] = []
+    cur: Optional[TxtCellBlock] = None
+    seen_first_cell = False
+
+    for ln in lines:
+        mcell = cell_pat.match(ln)
+        if mcell:
+            seen_first_cell = True
+            if cur is not None:
+                cells.append(cur)
+            cur = TxtCellBlock(
+                cell_label=f"Cell {mcell.group(1)}",
+                header_lines=[ln],
+                prog_map={},
+            )
+            continue
+
+        if not seen_first_cell:
+            global_header.append(ln)
+            continue
+
+        assert cur is not None
+        mmap = map_pat.match(ln)
+        if mmap:
+            pid, name = mmap.group(1), mmap.group(2).strip()
+            cur.prog_map[pid] = name
+        else:
+            cur.header_lines.append(ln)
+
+    if cur is not None:
+        cells.append(cur)
+
+    meta = {}
+    raw = " | ".join([x.strip() for x in global_header if x.strip()])
+    if raw:
+        meta["Metadata_Raw"] = raw
+
+    for ln in global_header:
+        l = ln.strip()
+        if not l:
+            continue
+        m = re.match(r"^([^:=]{2,40})\s*[:=]\s*(.+)$", l)
+        if m:
+            key = re.sub(r"\s+", "_", m.group(1).strip().lower())
+            meta[key] = m.group(2).strip()
+
+    joined = " ".join(global_header).lower()
+    if "male" in joined:
+        meta["sex"] = "Male"
+    elif "female" in joined:
+        meta["sex"] = "Female"
+
+    return meta, cells, global_header
+
+
+# =========================
+# Protocol normalization
+# =========================
+def normalize_protocol_name(name: str) -> str:
+    n = name.strip().lower()
+    n = re.sub(r"\s+", " ", n)
+    return n
+
+
+def canonical_protocol(name: str) -> Optional[str]:
+    if not name:
+        return None
+    n = normalize_protocol_name(name)
+
+    if n.startswith("i0") and "-60" in n:
+        return "IGNORE"
+
+    if n == "i0" or n.startswith("i0 "):
+        return "i0"
+
+
+    if "ivcc" in n:
+        return "ivcc"
+
+    if n.startswith("rheo") or "rheobase" in n or "ramp" in n:
+        return "rheo"
+
+    return None
+
+
+# =========================
+# AP detection + spike features
+# =========================
+def detect_spikes_dvdt(
+    v_mV: np.ndarray,
+    fs: float,
+    dvdt_thresh_V_per_s: float = 10.0,
+    min_peak_mV: Optional[float] = -10.0,
+    min_amp_from_thresh_mV: Optional[float] = None,
+    refractory_s: float = 0.002,
+) -> List[dict]:
+    dvdt = dvdt_mV_per_ms(v_mV, fs)  # mV/ms == V/s numerically
+    above = dvdt > dvdt_thresh_V_per_s
+    crossings = np.where(np.logical_and(above[1:], ~above[:-1]))[0] + 1
+    if crossings.size == 0:
+        return []
+
+    spikes = []
+    refr = int(refractory_s * fs)
+    last = -10**12
+
+    for i in crossings:
+        if i - last < refr:
+            continue
+
+        win = int(0.005 * fs)
+        j2 = min(v_mV.size, i + win)
+        peak_idx = i + int(np.argmax(v_mV[i:j2]))
+        peak_mV = float(v_mV[peak_idx])
+        thr_mV = float(v_mV[i])
+        amp_from_thresh_mV = peak_mV - thr_mV
+
+        if min_peak_mV is not None and peak_mV < min_peak_mV:
+            continue
+        if min_amp_from_thresh_mV is not None and amp_from_thresh_mV < min_amp_from_thresh_mV:
+            continue
+
+        half = thr_mV + 0.5 * amp_from_thresh_mV
+
+        up = v_mV[i:peak_idx + 1]
+        up_cross = np.where(up >= half)[0]
+        up_idx = i + int(up_cross[0]) if up_cross.size else i
+
+        down = v_mV[peak_idx:]
+        down_cross = np.where(down <= half)[0]
+        down_idx = peak_idx + int(down_cross[0]) if down_cross.size else peak_idx
+
+        spikes.append({
+            "thr_idx": int(i),
+            "thr_mV": thr_mV,
+            "peak_idx": int(peak_idx),
+            "peak_mV": peak_mV,
+            "amp_from_thresh_mV": float(amp_from_thresh_mV),
+            "halfwidth_s": float((down_idx - up_idx) / fs),
+            "dvdt_max_V_per_s": float(np.max(dvdt[i:min(v_mV.size, i + win)])),
+        })
+        last = i
+
+    return spikes
+
+
+def extract_peak_aligned_snippet(
+    v: np.ndarray,
+    fs: float,
+    peak_idx: int,
+    pre_ms: float = AP_SNIP_PRE_MS,
+    post_ms: float = AP_SNIP_POST_MS,
+):
+    pre = int((pre_ms / 1000.0) * fs)
+    post = int((post_ms / 1000.0) * fs)
+    a = max(0, peak_idx - pre)
+    b = min(v.size, peak_idx + post)
+    snip = v[a:b].astype(float)
+    target = pre + post
+    if snip.size < target:
+        snip = np.concatenate([snip, np.full(target - snip.size, np.nan)])
+    t_ms = (np.arange(target) - pre) / fs * 1000.0
+    dvdt = dvdt_mV_per_ms(snip, fs)
+    return t_ms, snip, dvdt
+
+
+def local_ap_baseline(v: np.ndarray, fs: float, thr_idx: int, pre_ms: float = AP_LOCAL_BASELINE_PRE_MS) -> float:
+    w = max(1, int((pre_ms / 1000.0) * fs))
+    a = max(0, thr_idx - w)
+    b = max(a + 1, thr_idx)
+    return float(np.median(v[a:b]))
+
+
+def spike_features_from_indices(v: np.ndarray, fs: float, thr_idx: int, peak_idx: int) -> dict:
+    v = v.astype(float)
+    dvdt = dvdt_mV_per_ms(v, fs)
+
+    Vbase = local_ap_baseline(v, fs, thr_idx)
+    Vth = float(v[thr_idx])
+    Vpk = float(v[peak_idx])
+
+    v10 = Vth + 0.1 * (Vpk - Vth)
+    v90 = Vth + 0.9 * (Vpk - Vth)
+    rise_seg = v[thr_idx:peak_idx + 1]
+    i10 = np.where(rise_seg >= v10)[0]
+    i90 = np.where(rise_seg >= v90)[0]
+    rise_10_90_ms = np.nan
+    if i10.size and i90.size:
+        rise_10_90_ms = (int(i90[0]) - int(i10[0])) / fs * 1000.0
+
+    half = Vth + 0.5 * (Vpk - Vth)
+    up = v[thr_idx:peak_idx + 1]
+    up_cross = np.where(up >= half)[0]
+    up_idx = thr_idx + int(up_cross[0]) if up_cross.size else thr_idx
+    down = v[peak_idx:]
+    down_cross = np.where(down <= half)[0]
+    down_idx = peak_idx + int(down_cross[0]) if down_cross.size else peak_idx
+    halfwidth_ms = (down_idx - up_idx) / fs * 1000.0
+
+    max_dvdt = float(np.max(dvdt[thr_idx:min(v.size, thr_idx + int(0.01 * fs))]))
+    win = int(0.01 * fs)
+    a = max(0, peak_idx - win)
+    b = min(v.size, peak_idx + win)
+    min_dvdt = float(np.min(dvdt[a:b])) if b > a else np.nan
+
+    def window_min(win_ms):
+        a_ms, b_ms = win_ms
+        i1 = peak_idx + int((a_ms / 1000.0) * fs)
+        i2 = peak_idx + int((b_ms / 1000.0) * fs)
+        i1 = max(0, min(v.size - 1, i1))
+        i2 = max(i1 + 1, min(v.size, i2))
+        seg = v[i1:i2]
+        if seg.size < 2:
+            return np.nan, np.nan
+        j = int(np.argmin(seg))
+        vmin = float(seg[j])
+        t_ms = (i1 + j - peak_idx) / fs * 1000.0
+        return vmin, t_ms
+
+    raw_fVmin, ft = window_min(FAHP_WIN_MS)
+    raw_mVmin, mt = window_min(MAHP_WIN_MS)
+
+    fAHP_present = np.isfinite(raw_fVmin) and (raw_fVmin < Vbase)
+    mAHP_present = np.isfinite(raw_mVmin) and (raw_mVmin < Vbase)
+
+    fVmin = float(raw_fVmin) if fAHP_present else np.nan
+    mVmin = float(raw_mVmin) if mAHP_present else np.nan
+
+    fAHP_depth = float(Vbase - raw_fVmin) if fAHP_present else np.nan
+    mAHP_depth = float(Vbase - raw_mVmin) if mAHP_present else np.nan
+
+    adp_mV = np.nan
+    adp_t = np.nan
+    if np.isfinite(fVmin):
+        i1 = peak_idx + int((ADP_WIN_MS[0] / 1000.0) * fs)
+        i2 = peak_idx + int((ADP_WIN_MS[1] / 1000.0) * fs)
+        i1 = max(0, min(v.size - 1, i1))
+        i2 = max(i1 + 1, min(v.size, i2))
+        seg = v[i1:i2]
+        if seg.size:
+            j = int(np.argmax(seg))
+            vmax = float(seg[j])
+            adp_mV = vmax - float(fVmin)
+            adp_t = (i1 + j - peak_idx) / fs * 1000.0
+
+    return {
+        "LocalBaseline_mV": float(Vbase),
+        "Vth_mV": Vth,
+        "Threshold_fromBaseline_mV": float(Vth - Vbase),
+        "Vpeak_mV": Vpk,
+        "AP_Amp_fromThresh_mV": float(Vpk - Vth),
+        "AP_Amp_fromBaseline_mV": float(Vpk - Vbase),
+        "Halfwidth_ms": float(halfwidth_ms),
+        "Rise10_90_ms": float(rise_10_90_ms),
+        "Max_dVdt_V_per_s": float(max_dvdt),
+        "Min_dVdt_V_per_s": float(min_dvdt),
+        "fAHP_Vmin_mV": float(fVmin) if np.isfinite(fVmin) else np.nan,
+        "fAHP_Depth_mV": float(fAHP_depth) if np.isfinite(fAHP_depth) else np.nan,
+        "fAHP_t_ms": float(ft) if fAHP_present else np.nan,
+        "mAHP_Vmin_mV": float(mVmin) if np.isfinite(mVmin) else np.nan,
+        "mAHP_Depth_mV": float(mAHP_depth) if np.isfinite(mAHP_depth) else np.nan,
+        "mAHP_t_ms": float(mt) if mAHP_present else np.nan,
+        "ADP_mV": float(adp_mV),
+        "ADP_t_ms": float(adp_t),
+    }
+
+
+def adaptation_index_from_spikes(spikes: List[dict], fs: float) -> float:
+    if len(spikes) < 3:
+        return np.nan
+    isi_s = np.diff([s["thr_idx"] for s in spikes]) / fs
+    isi_s = isi_s[isi_s > 0]
+    if isi_s.size < 2:
+        return np.nan
+    first_isi = float(isi_s[0])
+    last_isi = float(isi_s[-1])
+    if first_isi <= 0:
+        return np.nan
+    return float(last_isi / first_isi)
+
+
+# =========================
+# I0 spike train metrics
+# =========================
+def rhythmicity_index(spike_times_s: np.ndarray, duration_s: float) -> Tuple[float, float]:
+    if duration_s <= 0 or spike_times_s.size < 3:
+        return np.nan, np.nan
+
+    dt = RHYTHM_BIN_S
+    nb = int(np.ceil(duration_s / dt))
+    b = np.zeros(nb, float)
+    idx = np.clip((spike_times_s / dt).astype(int), 0, nb - 1)
+    for k in idx:
+        b[k] += 1.0
+
+    ac = np.correlate(b, b, mode="full")
+    ac = ac[ac.size // 2:]
+    lags = np.arange(ac.size) * dt
+
+    ac0 = ac[1:]
+    l0 = lags[1:]
+    if np.max(ac0) <= 0:
+        return np.nan, np.nan
+    acn = ac0 / np.max(ac0)
+
+    a, bb = RHYTHM_PEAK_SEARCH_S
+    m = (l0 >= a) & (l0 <= bb)
+    if not np.any(m):
+        return np.nan, np.nan
+
+    seg = acn[m]
+    seg_l = l0[m]
+    pi = int(np.argmax(seg))
+    peak = float(seg[pi])
+    peak_lag = float(seg_l[pi])
+
+    m2 = (l0 >= 0) & (l0 <= peak_lag)
+    trough = float(np.min(acn[m2])) if np.any(m2) else np.nan
+
+    denom = peak + trough
+    ri = (peak - trough) / denom if (np.isfinite(trough) and denom > 1e-9) else np.nan
+    return ri, peak_lag
+
+
+def compute_spike_train_metrics(spike_times_s: np.ndarray, duration_s: float) -> dict:
+    out = {}
+    n = spike_times_s.size
+    out["n_spikes"] = int(n)
+    out["firing_hz"] = float(n / duration_s) if duration_s > 0 else np.nan
+
+    if n < 2:
+        for k in [
+            "isi_mean_s", "isi_median_s", "isi_p10_s", "isi_p90_s", "isi_cv", "cv2",
+            "fano_1s", "rate_stability_cv_5s", "rhythmicity_index", "rhythm_peak_lag_s"
+        ]:
+            out[k] = np.nan
+        return out
+
+    isis = np.diff(spike_times_s)
+    out["isi_mean_s"] = float(np.mean(isis))
+    out["isi_median_s"] = float(np.median(isis))
+    out["isi_p10_s"] = float(np.quantile(isis, 0.10))
+    out["isi_p90_s"] = float(np.quantile(isis, 0.90))
+    out["isi_cv"] = float(np.std(isis) / np.mean(isis)) if np.mean(isis) > 0 else np.nan
+
+    if isis.size >= 2:
+        isi1, isi2 = isis[:-1], isis[1:]
+        out["cv2"] = float(np.mean(2 * np.abs(isi2 - isi1) / (isi2 + isi1)))
+    else:
+        out["cv2"] = np.nan
+
+    if duration_s > 0:
+        nb = int(np.ceil(duration_s / FANO_BIN_S))
+        edges = np.linspace(0, nb * FANO_BIN_S, nb + 1)
+        counts, _ = np.histogram(spike_times_s, bins=edges)
+        m = np.mean(counts)
+        v = np.var(counts)
+        out["fano_1s"] = float(v / m) if m > 0 else np.nan
+
+        nb2 = int(np.ceil(duration_s / RATE_STABILITY_BIN_S))
+        edges2 = np.linspace(0, nb2 * RATE_STABILITY_BIN_S, nb2 + 1)
+        c2, _ = np.histogram(spike_times_s, bins=edges2)
+        m2 = np.mean(c2)
+        sd2 = np.std(c2)
+        out["rate_stability_cv_5s"] = float(sd2 / m2) if m2 > 0 else np.nan
+    else:
+        out["fano_1s"] = np.nan
+        out["rate_stability_cv_5s"] = np.nan
+
+    ri, lag = rhythmicity_index(spike_times_s, duration_s)
+    out["rhythmicity_index"] = float(ri)
+    out["rhythm_peak_lag_s"] = float(lag)
+    return out
+
+
+# =========================
+# IVCC helper functions
+# =========================
+def step_steady_state(v: np.ndarray, fs: float, a: int, b: int) -> float:
+    w = int(IVCC_STEADY_WINDOW_S * fs)
+    aa = max(a, b - w)
+    return float(np.median(v[aa:b]))
+
+
+def tau_step_preference_rank(step_pA: float) -> int:
+    prefs = list(TAU_FIT_STEPS_PA)
+    try:
+        return prefs.index(float(step_pA))
+    except ValueError:
+        return len(prefs) + int(round(abs(float(step_pA))))
+
+
+def fit_tau_from_step_crossing(v: np.ndarray, fs: float, step_on_idx: int, step_end_idx: int, fit_ms: float = TAU_FIT_WINDOW_MS) -> dict:
+    out = {
+        "tau_s": np.nan,
+        "baseline_mV": np.nan,
+        "steady_mV": np.nan,
+        "delta_mV": np.nan,
+        "r2": np.nan,
+        "rmse_mV": np.nan,
+        "method": "",
+    }
+
+    if step_end_idx <= step_on_idx + int(0.02 * fs):
+        return out
+
+    base_a = max(0, step_on_idx - int(0.05 * fs))
+    baseline = float(np.median(v[base_a:step_on_idx])) if step_on_idx > base_a else float(v[step_on_idx])
+
+    ss_w = int(IVCC_STEADY_WINDOW_S * fs)
+    ss_a = max(step_on_idx, step_end_idx - ss_w)
+    steady = float(np.median(v[ss_a:step_end_idx])) if step_end_idx > ss_a else np.nan
+    if not np.isfinite(steady):
+        return out
+
+    delta = steady - baseline
+    out["baseline_mV"] = float(baseline)
+    out["steady_mV"] = float(steady)
+    out["delta_mV"] = float(delta)
+
+    if abs(delta) < TAU_MIN_DEFLECTION_MV:
+        return out
+
+    fit_end_idx = min(v.size, step_end_idx, step_on_idx + int((fit_ms / 1000.0) * fs))
+    if fit_end_idx <= step_on_idx + 2:
+        return out
+
+    seg = v[step_on_idx:fit_end_idx].astype(float)
+    target = baseline + (1.0 - np.exp(-1.0)) * delta
+
+    if delta < 0:
+        cross = np.where(seg <= target)[0]
+    else:
+        cross = np.where(seg >= target)[0]
+    if cross.size == 0:
+        return out
+
+    j = int(cross[0])
+    if j == 0:
+        tau_s = 0.0
+    else:
+        y0 = float(seg[j - 1])
+        y1 = float(seg[j])
+        if not np.isfinite(y0) or not np.isfinite(y1) or abs(y1 - y0) < 1e-12:
+            frac = 1.0
+        else:
+            frac = float(np.clip((target - y0) / (y1 - y0), 0.0, 1.0))
+        tau_s = ((j - 1) + frac) / fs
+
+    tau_ms = tau_s * 1000.0
+    if tau_ms < TAU_MIN_MS or tau_ms > TAU_MAX_MS:
+        return out
+
+    out["tau_s"] = float(tau_s)
+    out["method"] = "63pct_crossing"
+    return out
+
+
+def fit_tau_from_step_exp(v: np.ndarray, fs: float, step_on_idx: int, step_end_idx: int, fit_ms: float = TAU_FIT_WINDOW_MS) -> dict:
+    out = {
+        "tau_s": np.nan,
+        "baseline_mV": np.nan,
+        "steady_mV": np.nan,
+        "delta_mV": np.nan,
+        "r2": np.nan,
+        "rmse_mV": np.nan,
+        "method": "",
+    }
+
+    if step_end_idx <= step_on_idx + int(0.02 * fs):
+        return out
+
+    base_a = max(0, step_on_idx - int(0.05 * fs))
+    baseline = float(np.median(v[base_a:step_on_idx])) if step_on_idx > base_a else float(v[step_on_idx])
+
+    ss_w = int(IVCC_STEADY_WINDOW_S * fs)
+    ss_a = max(step_on_idx, step_end_idx - ss_w)
+    steady = float(np.median(v[ss_a:step_end_idx])) if step_end_idx > ss_a else np.nan
+    if not np.isfinite(steady):
+        return out
+
+    delta = steady - baseline
+    out["baseline_mV"] = float(baseline)
+    out["steady_mV"] = float(steady)
+    out["delta_mV"] = float(delta)
+
+    if delta >= 0:
+        return out
+    if abs(delta) < TAU_MIN_DEFLECTION_MV:
+        return out
+
+    fit_end_idx = min(v.size, step_end_idx, step_on_idx + int((fit_ms / 1000.0) * fs))
+    if fit_end_idx <= step_on_idx + 5:
+        return out
+
+    y = v[step_on_idx:fit_end_idx].astype(float)
+    x = np.arange(y.size, dtype=float) / fs
+
+    def exp_model(t_s, v_inf, amp, tau_s):
+        return v_inf + amp * np.exp(-t_s / tau_s)
+
+    amp0 = baseline - steady
+    tau0 = min(max((fit_ms / 1000.0) / 3.0, TAU_MIN_MS / 1000.0), TAU_MAX_MS / 1000.0)
+
+    lower_v = min(np.min(y), steady) - 20.0
+    upper_v = max(np.max(y), baseline) + 20.0
+
+    try:
+        popt, _ = curve_fit(
+            exp_model,
+            x,
+            y,
+            p0=(steady, amp0, tau0),
+            bounds=(
+                [lower_v, 0.0, TAU_MIN_MS / 1000.0],
+                [upper_v, max(200.0, abs(amp0) * 5.0 + 20.0), TAU_MAX_MS / 1000.0],
+            ),
+            maxfev=20000,
+        )
+    except Exception:
+        return out
+
+    v_inf, amp, tau_s = [float(z) for z in popt]
+    if amp <= 0:
+        return out
+
+    yhat = exp_model(x, v_inf, amp, tau_s)
+    ss_res = float(np.sum((y - yhat) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else np.nan
+    rmse = float(np.sqrt(np.mean((y - yhat) ** 2)))
+
+    tau_ms = tau_s * 1000.0
+    if tau_ms < TAU_MIN_MS or tau_ms > TAU_MAX_MS:
+        return out
+    if np.isfinite(r2) and r2 < TAU_MIN_R2:
+        return out
+    if np.isfinite(rmse) and rmse > TAU_MAX_RMSE_MV:
+        return out
+
+    out["tau_s"] = float(tau_s)
+    out["r2"] = float(r2)
+    out["rmse_mV"] = float(rmse)
+    out["method"] = "exp_fit"
+    return out
+
+
+def fit_tau_from_step(v: np.ndarray, t: np.ndarray, fs: float, step_on_idx: int, step_end_idx: int, fit_ms: float = TAU_FIT_WINDOW_MS) -> dict:
+    """
+    Robust tau estimate for small hyperpolarizing IVCC steps.
+
+    Priority:
+      1) single-exponential fit to the early charging phase
+      2) fallback 63.2% crossing estimate if the fit fails
+    """
+    fit_res = fit_tau_from_step_exp(v, fs, step_on_idx, step_end_idx, fit_ms=fit_ms)
+    if np.isfinite(fit_res["tau_s"]):
+        return fit_res
+    return fit_tau_from_step_crossing(v, fs, step_on_idx, step_end_idx, fit_ms=fit_ms)
+
+
+def select_best_tau_candidate(candidates: List[dict]) -> Optional[dict]:
+    if not candidates:
+        return None
+
+    exp_candidates = [c for c in candidates if c.get("method") == "exp_fit" and np.isfinite(c.get("tau_s", np.nan))]
+    if exp_candidates:
+        exp_candidates = sorted(
+            exp_candidates,
+            key=lambda c: (
+                tau_step_preference_rank(c.get("Step_pA", np.nan)),
+                np.inf if not np.isfinite(c.get("rmse_mV", np.nan)) else c.get("rmse_mV", np.nan),
+                -np.inf if not np.isfinite(c.get("r2", np.nan)) else -c.get("r2", np.nan),
+            )
+        )
+        best_pref = tau_step_preference_rank(exp_candidates[0].get("Step_pA", np.nan))
+        same_pref = [c for c in exp_candidates if tau_step_preference_rank(c.get("Step_pA", np.nan)) == best_pref]
+        same_pref = sorted(
+            same_pref,
+            key=lambda c: (
+                np.inf if not np.isfinite(c.get("rmse_mV", np.nan)) else c.get("rmse_mV", np.nan),
+                -np.inf if not np.isfinite(c.get("r2", np.nan)) else -c.get("r2", np.nan),
+            )
+        )
+        return same_pref[0]
+
+    cross_candidates = [c for c in candidates if np.isfinite(c.get("tau_s", np.nan))]
+    if not cross_candidates:
+        return None
+
+    cross_candidates = sorted(
+        cross_candidates,
+        key=lambda c: (
+            tau_step_preference_rank(c.get("Step_pA", np.nan)),
+            abs(c.get("delta_mV", np.nan)) if np.isfinite(c.get("delta_mV", np.nan)) else np.inf,
+        )
+    )
+    return cross_candidates[0]
+
+
+def compute_sag_metrics(v: np.ndarray, fs: float, a: int, b: int) -> Tuple[float, float]:
+    pre = int(0.05 * fs)
+    base_a = max(0, a - pre)
+    baseline = float(np.median(v[base_a:a])) if a > base_a else float(np.median(v[:max(1, int(0.05 * fs))]))
+
+    e1 = a + int((SAG_EARLY_MS[0] / 1000.0) * fs)
+    e2 = a + int((SAG_EARLY_MS[1] / 1000.0) * fs)
+    e1 = max(a, min(b - 1, e1))
+    e2 = max(e1 + 1, min(b, e2))
+    vmin = float(np.min(v[e1:e2])) if e2 > e1 else np.nan
+
+    w = int((SAG_STEADY_LAST_MS / 1000.0) * fs)
+    ss_a = max(a, b - w)
+    vsteady = float(np.median(v[ss_a:b])) if b > ss_a else np.nan
+
+    sag = vsteady - vmin if (np.isfinite(vsteady) and np.isfinite(vmin)) else np.nan
+    denom = baseline - vmin
+    sag_ratio = sag / denom if (np.isfinite(sag) and abs(denom) > 1e-9) else np.nan
+    return float(sag), float(sag_ratio)
+
+
+def detect_rebound_spikes(v: np.ndarray, fs: float, step_end_idx: int) -> Tuple[int, float]:
+    w = int((REBOUND_WIN_MS / 1000.0) * fs)
+    a = step_end_idx
+    b = min(v.size, step_end_idx + w)
+    spikes = detect_spikes_dvdt(v[a:b], fs, dvdt_thresh_V_per_s=DV_DT_THRESH_IVCC_V_PER_S)
+    if not spikes:
+        return 0, np.nan
+    return len(spikes), float(spikes[0]["thr_idx"] / fs)
+
+
+# =========================
+# Rheo / ramp helper functions
+# =========================
+def find_ramp_window_from_command(cmd_pA: Optional[np.ndarray], fs: float, npts: int) -> Tuple[int, int]:
+    """
+    Fixed ramp timing:
+    ramp starts at 2.15 s and ends at 7.15 s.
+    """
+    a = int(round(RHEO_RAMP_START_S * fs))
+    b = int(round(RHEO_RAMP_END_S * fs))
+
+    a = max(0, min(npts - 1, a))
+    b = max(a + 1, min(npts, b))
+    return a, b
+
+
+def subset_spikes_to_window(spikes: List[dict], a: int, b: int) -> List[dict]:
+    return [s for s in spikes if a <= s["thr_idx"] < b]
+
+
+def compute_ramp_metrics(v: np.ndarray, cmd_pA: Optional[np.ndarray], fs: float, spikes: List[dict], ramp_a: int, ramp_b: int) -> dict:
+    """
+    Compute extra ramp metrics:
+    - spike count during ramp
+    - max instantaneous freq during ramp
+    - last spike current during ramp
+    - conservative depolarization block call
+    """
+    out = {
+        "RampStart_s": float(ramp_a / fs),
+        "RampEnd_s": float(ramp_b / fs),
+        "RampDuration_s": float((ramp_b - ramp_a) / fs),
+        "Ramp_SpikeCount_N": int(len(spikes)),
+        "Ramp_MaxInstFreq_Hz": np.nan,
+        "Ramp_LastSpikeCurrent_pA": np.nan,
+        "Ramp_DepolBlock_bool": 0.0,
+        "Ramp_DepolBlock_Current_pA": np.nan,
+        "Ramp_DepolBlock_Vm_mV": np.nan,
+    }
+
+    if len(spikes) >= 2:
+        isi_s = np.diff([s["thr_idx"] for s in spikes]) / fs
+        isi_s = isi_s[isi_s > 0]
+        if isi_s.size:
+            out["Ramp_MaxInstFreq_Hz"] = float(1.0 / np.min(isi_s))
+
+    if not spikes:
+        return out
+
+    last_spike = spikes[-1]
+    if cmd_pA is not None and cmd_pA.size == v.size:
+        out["Ramp_LastSpikeCurrent_pA"] = float(cmd_pA[last_spike["thr_idx"]])
+
+    if len(spikes) < RHEO_BLOCK_MIN_SPIKES:
+        return out
+    if cmd_pA is None or cmd_pA.size != v.size:
+        return out
+
+    last_thr_idx = int(last_spike["thr_idx"])
+    last_peak_idx = int(last_spike["peak_idx"])
+    remaining_s = (ramp_b - last_peak_idx) / fs
+    if remaining_s < RHEO_BLOCK_MIN_REMAINDER_S:
+        return out
+
+    I_last = float(cmd_pA[last_thr_idx])
+    I_end = float(cmd_pA[ramp_b - 1]) if ramp_b > 0 else np.nan
+    if not np.isfinite(I_last) or not np.isfinite(I_end):
+        return out
+    if (I_end - I_last) < RHEO_BLOCK_MIN_CURRENT_CONTINUE_PA:
+        return out
+
+    post_start = last_peak_idx + int((RHEO_BLOCK_POST_START_MS / 1000.0) * fs)
+    post_start = max(post_start, last_peak_idx + 1)
+    post_end = ramp_b
+    if post_end <= post_start + 5:
+        return out
+
+    plateau_seg = v[post_start:post_end].astype(float)
+    if plateau_seg.size < 5:
+        return out
+
+    plateau_vm = float(np.median(plateau_seg))
+    if plateau_vm < RHEO_BLOCK_PLATEAU_MIN_MV:
+        return out
+
+    out["Ramp_DepolBlock_bool"] = 1.0
+    out["Ramp_DepolBlock_Current_pA"] = float(I_last)
+    out["Ramp_DepolBlock_Vm_mV"] = float(plateau_vm)
+    return out
+
+
+# =========================
+# IVCC: FIXED STEP-WINDOW analysis
+# =========================
+def analyze_ivcc(abf: pyabf.ABF):
+    fs = get_fs(abf)
+    steps_expected = np.arange(
+        IVCC_STEP_START_PA,
+        IVCC_STEP_END_PA + 0.5 * IVCC_STEP_DELTA_PA,
+        IVCC_STEP_DELTA_PA,
+    )
+
+    per_step_rows = []
+    one_ap_rows = []
+    wave_snips = {}
+
+    step_has_spike: Dict[float, bool] = {}
+    tau_candidates = []
+    sag_by_I: Dict[float, Tuple[float, float]] = {}
+    rebound_by_I: Dict[float, Tuple[int, float]] = {}
+    adapt_candidates = []
+
+    for sw in range(abf.sweepCount):
+        abf.setSweep(sw, channel=0)
+        if abf.sweepUnitsY.lower() != "mv":
+            continue
+
+        v = abf.sweepY.astype(float)
+        t = abf.sweepX.astype(float)
+
+        try:
+            cmd = abf.sweepC.astype(float)
+            cmd_units = getattr(abf, "sweepUnitsC", None)
+            cmd = cmd * unit_to_scale_to_pA(cmd_units)
+        except Exception:
+            cmd = None
+
+        if cmd is None or cmd.size != v.size or t.size != v.size:
+            continue
+
+        a = idx_from_time(t, IVCC_STEP_WIN_START_S)
+        b = idx_from_time(t, IVCC_STEP_WIN_END_S)
+        if b <= a + int(0.05 * fs):
+            continue
+
+        rawI = float(np.median(cmd[a:b]))
+        I = float(steps_expected[np.argmin(np.abs(steps_expected - rawI))])
+
+        vss = step_steady_state(v, fs, a, b)
+        seg = v[a:b]
+        spikes = detect_spikes_dvdt(seg, fs, dvdt_thresh_V_per_s=DV_DT_THRESH_IVCC_V_PER_S)
+        nsp = len(spikes)
+        dur = (b - a) / fs
+        freq = (nsp / dur) if dur > 0 else np.nan
+        lat = (spikes[0]["thr_idx"] / fs) if spikes else np.nan
+        if np.isfinite(lat) and lat > dur:
+            lat = np.nan
+
+        per_step_rows.append({
+            "Sweep": sw,
+            "Step_pA": float(I),
+            "StepRaw_pA": float(rawI),
+            "V_ss_mV": float(vss),
+            "Spikes_N": int(nsp),
+            "Freq_Hz": float(freq) if np.isfinite(freq) else np.nan,
+            "FirstLatency_s": float(lat) if np.isfinite(lat) else np.nan,
+        })
+
+        step_has_spike[I] = (nsp > 0)
+
+        if (I in TAU_FIT_STEPS_PA) and (I < 0) and (nsp == 0):
+            tau_res = fit_tau_from_step(v, t, fs, a, b, fit_ms=TAU_FIT_WINDOW_MS)
+            if np.isfinite(tau_res.get("tau_s", np.nan)) and tau_res["tau_s"] > 0:
+                tau_res = dict(tau_res)
+                tau_res["Sweep"] = int(sw)
+                tau_res["Step_pA"] = float(I)
+                tau_candidates.append(tau_res)
+
+        if I < 0:
+            sag, sag_ratio = compute_sag_metrics(v, fs, a, b)
+            sag_by_I[I] = (float(sag), float(sag_ratio))
+            nreb, lreb = detect_rebound_spikes(v, fs, b)
+            rebound_by_I[I] = (int(nreb), float(lreb) if np.isfinite(lreb) else np.nan)
+
+        if spikes and I > 0:
+            s0 = spikes[0]
+            thr_idx = a + s0["thr_idx"]
+            peak_idx = a + s0["peak_idx"]
+
+            feats = spike_features_from_indices(v, fs, thr_idx, peak_idx)
+            feats["IVCC_1AP_Step_pA"] = float(I)
+            feats["IVCC_1AP_Latency_s"] = float((thr_idx - a) / fs)
+            one_ap_rows.append({"Sweep": sw, **feats})
+
+            t_ms, v_snip, dvdt_snip = extract_peak_aligned_snippet(v, fs, peak_idx)
+            wave_snips[sw] = {"t_ms": t_ms, "v_mV": v_snip, "dvdt_V_per_s": dvdt_snip, "Step_pA": float(I)}
+
+        else:
+            one_ap_rows.append({"Sweep": sw, "IVCC_1AP_Step_pA": np.nan})
+
+        if I > 0:
+            adapt_idx = adaptation_index_from_spikes(spikes, fs)
+            if np.isfinite(adapt_idx):
+                adapt_candidates.append({"Step_pA": float(I), "AdaptationIndex": float(adapt_idx)})
+
+    df_steps = pd.DataFrame(per_step_rows)
+    df_1ap = pd.DataFrame(one_ap_rows)
+
+    rin_mohm = np.nan
+    if not df_steps.empty:
+        sub = df_steps[(df_steps["Spikes_N"] == 0) & (df_steps["Step_pA"].notna()) & (df_steps["V_ss_mV"].notna())]
+        if not sub.empty:
+            I_arr = sub["Step_pA"].astype(float).values
+            V_arr = sub["V_ss_mV"].astype(float).values
+            if np.unique(I_arr).size >= 3:
+                m, _ = np.polyfit(I_arr, V_arr, 1)   # mV/pA = GOhm
+                rin_mohm = float(m * 1000.0)         # MOhm
+
+    tau_best = select_best_tau_candidate(tau_candidates)
+    tau_s = float(tau_best["tau_s"]) if tau_best is not None and np.isfinite(tau_best.get("tau_s", np.nan)) else np.nan
+    tau_ms = float(tau_s * 1000.0) if np.isfinite(tau_s) else np.nan
+    tau_step_used = float(tau_best["Step_pA"]) if tau_best is not None and np.isfinite(tau_best.get("Step_pA", np.nan)) else np.nan
+    tau_method = tau_best.get("method", "") if tau_best is not None else ""
+    tau_r2 = float(tau_best["r2"]) if tau_best is not None and np.isfinite(tau_best.get("r2", np.nan)) else np.nan
+    tau_rmse = float(tau_best["rmse_mV"]) if tau_best is not None and np.isfinite(tau_best.get("rmse_mV", np.nan)) else np.nan
+
+    cm_pf = np.nan
+    if np.isfinite(tau_s) and np.isfinite(rin_mohm) and rin_mohm > 0:
+        cm_pf = float((tau_s / rin_mohm) * 1e6)
+
+    sag_mV = np.nan
+    sag_ratio = np.nan
+    rebound_bool = np.nan
+    rebound_n = np.nan
+    rebound_lat = np.nan
+    if sag_by_I:
+        Ineg = min(sag_by_I.keys())
+        sag_mV, sag_ratio = sag_by_I[Ineg]
+        if Ineg in rebound_by_I:
+            rebound_n, rebound_lat = rebound_by_I[Ineg]
+            rebound_bool = float(1.0 if rebound_n > 0 else 0.0)
+
+    step_rheo = np.nan
+    pos_spiking = sorted([I for I, has in step_has_spike.items() if (I > 0 and has)])
+    if pos_spiking:
+        step_rheo = float(pos_spiking[0])
+
+    max_step_freq = np.nan
+    if not df_steps.empty:
+        pos_freq = df_steps[(df_steps["Step_pA"] > 0) & (df_steps["Freq_Hz"].notna())]
+        if not pos_freq.empty:
+            max_step_freq = float(pos_freq["Freq_Hz"].max())
+
+    fi_slope = np.nan
+    if not df_steps.empty:
+        g = df_steps[
+            (df_steps["Step_pA"] >= FI_MIN_STEP_PA) &
+            (df_steps["Step_pA"] <= FI_MAX_STEP_PA) &
+            (df_steps["Spikes_N"] > 0) &
+            (df_steps["Freq_Hz"].notna())
+        ]
+        if len(g) >= 3:
+            I_arr = g["Step_pA"].astype(float).values
+            F_arr = g["Freq_Hz"].astype(float).values
+            m, _ = np.polyfit(I_arr, F_arr, 1)
+            fi_slope = float(m)
+
+    adaptation_index = np.nan
+    adaptation_step = np.nan
+    if adapt_candidates:
+        adapt_df = pd.DataFrame(adapt_candidates).sort_values("Step_pA")
+        adaptation_index = float(adapt_df.iloc[0]["AdaptationIndex"])
+        adaptation_step = float(adapt_df.iloc[0]["Step_pA"])
+
+    ap_peak = ap_amp_from_baseline = ap_halfwidth = np.nan
+    ap_fahp_vmin = ap_fahp_depth = np.nan
+    ap_mahp_vmin = ap_mahp_depth = np.nan
+    ap_maxspeed = ap_baseline = np.nan
+    selected_ap_step = np.nan
+
+    if not df_1ap.empty and "IVCC_1AP_Step_pA" in df_1ap.columns:
+        ap_ok = df_1ap[df_1ap["IVCC_1AP_Step_pA"].notna()].copy()
+        if not ap_ok.empty:
+            ap_ok = ap_ok.sort_values(["IVCC_1AP_Step_pA", "Sweep"])
+            ap_sel = ap_ok.iloc[0]
+            selected_ap_step = float(ap_sel["IVCC_1AP_Step_pA"])
+            ap_peak = float(ap_sel["Vpeak_mV"]) if "Vpeak_mV" in ap_sel else np.nan
+            ap_amp_from_baseline = float(ap_sel["AP_Amp_fromBaseline_mV"]) if "AP_Amp_fromBaseline_mV" in ap_sel else np.nan
+            ap_halfwidth = float(ap_sel["Halfwidth_ms"]) if "Halfwidth_ms" in ap_sel else np.nan
+            ap_fahp_vmin = float(ap_sel["fAHP_Vmin_mV"]) if "fAHP_Vmin_mV" in ap_sel else np.nan
+            ap_fahp_depth = float(ap_sel["fAHP_Depth_mV"]) if "fAHP_Depth_mV" in ap_sel else np.nan
+            ap_mahp_vmin = float(ap_sel["mAHP_Vmin_mV"]) if "mAHP_Vmin_mV" in ap_sel else np.nan
+            ap_mahp_depth = float(ap_sel["mAHP_Depth_mV"]) if "mAHP_Depth_mV" in ap_sel else np.nan
+            ap_maxspeed = float(ap_sel["Max_dVdt_V_per_s"]) if "Max_dVdt_V_per_s" in ap_sel else np.nan
+            ap_baseline = float(ap_sel["LocalBaseline_mV"]) if "LocalBaseline_mV" in ap_sel else np.nan
+
+    rin_gohm = (rin_mohm / 1000.0) if np.isfinite(rin_mohm) else np.nan
+
+    summ = {
+        "InputResistance_MOhm": float(rin_mohm) if np.isfinite(rin_mohm) else np.nan,
+        "InputResistance_GOhm": float(rin_gohm) if np.isfinite(rin_gohm) else np.nan,
+        "TimeConstant_ms": float(tau_ms) if np.isfinite(tau_ms) else np.nan,
+        "Capacitance_pF": float(cm_pf) if np.isfinite(cm_pf) else np.nan,
+        "TauCandidates_N": float(len(tau_candidates)),
+        "TauStepUsed_pA": float(tau_step_used) if np.isfinite(tau_step_used) else np.nan,
+        "TauFit_R2": float(tau_r2) if np.isfinite(tau_r2) else np.nan,
+        "TauFit_RMSE_mV": float(tau_rmse) if np.isfinite(tau_rmse) else np.nan,
+        "TauMethod": tau_method,
+        "Sag_mV": float(sag_mV) if np.isfinite(sag_mV) else np.nan,
+        "Sag_ratio": float(sag_ratio) if np.isfinite(sag_ratio) else np.nan,
+        "Rebound_bool": float(rebound_bool) if np.isfinite(rebound_bool) else np.nan,
+        "ReboundSpikes_N": float(rebound_n) if np.isfinite(rebound_n) else np.nan,
+        "ReboundFirstLatency_s": float(rebound_lat) if np.isfinite(rebound_lat) else np.nan,
+        "StepRheobase_pA": float(step_rheo) if np.isfinite(step_rheo) else np.nan,
+        "MaxStepFreq_Hz": float(max_step_freq) if np.isfinite(max_step_freq) else np.nan,
+        "FI_slope_Hz_per_pA": float(fi_slope) if np.isfinite(fi_slope) else np.nan,
+        "AdaptationIndex": float(adaptation_index) if np.isfinite(adaptation_index) else np.nan,
+        "AdaptationStep_pA": float(adaptation_step) if np.isfinite(adaptation_step) else np.nan,
+
+        # AP waveform metrics from the first spike at the lowest spiking IVCC step
+        "AP_SelectedStep_pA": float(selected_ap_step) if np.isfinite(selected_ap_step) else np.nan,
+        "AP_LocalBaseline_mV": float(ap_baseline) if np.isfinite(ap_baseline) else np.nan,
+        "AP_Peak_mV": ap_peak,
+        "AP_Amp_fromBaseline_mV": ap_amp_from_baseline,
+        "AP_MaxSpeed_V_per_s": ap_maxspeed,
+        "AP_Halfwidth_ms": ap_halfwidth,
+        "AP_fAHP_Vmin_mV": ap_fahp_vmin,
+        "AP_fAHP_Depth_mV": ap_fahp_depth,
+        "AP_mAHP_Vmin_mV": ap_mahp_vmin,
+        "AP_mAHP_Depth_mV": ap_mahp_depth,
+    }
+    return summ, df_steps, df_1ap, wave_snips
+
+
+
+# =========================
+# Other protocols
+# =========================
+def analyze_i0(abf: pyabf.ABF) -> Tuple[dict, np.ndarray]:
+    """Analyse spontaneous firing in confirmed I=0 current-clamp recordings.
+
+    Sweep times are concatenated for export, but *interval metrics* are
+    calculated only between spikes within the same sweep (not over boundaries).
+    Duration includes silent sweeps; a valid recording with zero APs is silent.
+    """
+    fs = get_fs(abf)
+    all_times, all_isis, rmp_vals = [], [], []
+    offset_s = 0.0
+    valid_sweeps = 0
+    for sw in range(abf.sweepCount):
+        abf.setSweep(sw, channel=0)
+        if str(abf.sweepUnitsY).strip().lower() != "mv":
+            continue
+        v = np.asarray(abf.sweepY, float)
+        if len(v) < 2:
+            continue
+        valid_sweeps += 1
+        rmp_vals.append(robust_median(v[:min(len(v), int(IVCC_BASELINE_WINDOW_S * fs))]))
+        indices = np.array([sp["thr_idx"] for sp in detect_spikes_dvdt(
+            v, fs, dvdt_thresh_V_per_s=DV_DT_THRESH_I0_V_PER_S)], dtype=float)
+        times = indices / fs
+        all_times.extend((offset_s + times).tolist())
+        if len(times) >= 2:
+            all_isis.extend(np.diff(times).tolist())
+        offset_s += len(v) / fs
+    if not valid_sweeps:
+        raise ValueError("No valid mV current-clamp sweeps in I0 recording")
+
+    spike_times = np.asarray(all_times, float)
+    isi = np.asarray(all_isis, float)
+    met = compute_spike_train_metrics(spike_times, offset_s)
+    # Replace concatenated-sweep ISI statistics with within-sweep values.
+    if len(isi):
+        met["isi_mean_s"] = float(np.mean(isi))
+        met["isi_median_s"] = float(np.median(isi))
+        met["isi_p10_s"] = float(np.quantile(isi, 0.1))
+        met["isi_p90_s"] = float(np.quantile(isi, 0.9))
+        met["isi_cv"] = float(np.std(isi, ddof=1) / np.mean(isi)) if len(isi) >= 2 and np.mean(isi) > 0 else np.nan
+    else:
+        for k in ("isi_mean_s", "isi_median_s", "isi_p10_s", "isi_p90_s", "isi_cv"):
+            met[k] = np.nan
+    # Compute CV2 only from adjacent ISIs within the SAME sweep.
+    cv2_by_sweep = []
+    for sw in range(abf.sweepCount):
+        abf.setSweep(sw, channel=0)
+        if str(abf.sweepUnitsY).strip().lower() != "mv":
+            continue
+        indices = [sp["thr_idx"] for sp in detect_spikes_dvdt(
+            np.asarray(abf.sweepY, float), fs,
+            dvdt_thresh_V_per_s=DV_DT_THRESH_I0_V_PER_S)]
+        d = np.diff(np.asarray(indices, float)) / fs
+        if len(d) >= 2:
+            cv2_by_sweep.extend((2 * np.abs(np.diff(d)) / (d[:-1] + d[1:])).tolist())
+    met["cv2"] = float(np.median(cv2_by_sweep)) if cv2_by_sweep else np.nan
+    pause_fraction = float(np.mean(isi > PAUSE_ISI_THRESHOLD_SECONDS)) if len(isi) else np.nan
+    burst_fraction = float(np.mean(isi < BURSTLIKE_ISI_THRESHOLD_SECONDS)) if len(isi) else np.nan
+    out = {
+        "RMP_mV": nanmed(rmp_vals),
+        "i0_freq_hz": met["firing_hz"],
+        "i0_n_spikes": met["n_spikes"],
+        "i0_isi_mean_s": met["isi_mean_s"],
+        "i0_isi_median_s": met["isi_median_s"],
+        "i0_isi_p10_s": met["isi_p10_s"],
+        "i0_isi_p90_s": met["isi_p90_s"],
+        "i0_isi_cv": met["isi_cv"],
+        "i0_cv2": met["cv2"],
+        "i0_pause_fraction": pause_fraction,
+        "i0_burstlike_fraction": burst_fraction,
+        "i0_fano_1s": met["fano_1s"],
+        "i0_rate_stability_cv_5s": met["rate_stability_cv_5s"],
+        "i0_rhythmicity_index": met["rhythmicity_index"],
+        "i0_rhythm_peak_lag_s": met["rhythm_peak_lag_s"],
+        "i0_duration_s": offset_s,
+        "i0_valid_sweeps": valid_sweeps,
+    }
+    return out, spike_times
+
+
+# =============================================================================
+# Spontaneous firing classification (I0 only)
+# =============================================================================
+# These are operational descriptors, not validated neuron identities or a
+# formal burst-detection algorithm. Adjust thresholds before comparing groups.
+SPARSE_HZ_THRESHOLD = 0.05
+MIN_SPIKES_FOR_PATTERN_CLASSIFICATION = 4
+TONIC_MEDIAN_CV2_MAX = 0.50
+TONIC_ISI_CV_MAX = 0.80
+PAUSE_ISI_THRESHOLD_SECONDS = 5.0
+TONIC_MAX_PAUSE_FRACTION = 0.20
+BURSTLIKE_ISI_THRESHOLD_SECONDS = 0.10  # descriptive only
+
+
+def classify_firing(frequency_hz, n_spikes, cv2, isi_cv, pause_fraction,
+                    has_i0: bool = True) -> Tuple[str, str, str]:
+    """Return (firing class, reason, warning), using the second script's rules.
+
+    A missing I0 recording is NEVER treated as a silent recording.
+    """
+    if not has_i0:
+        return "No I0 data", "No successfully analysed I0 recording", ""
+    if not np.isfinite(frequency_hz):
+        return "Unclassified", "Recording duration or frequency unavailable", ""
+    if n_spikes == 0 or frequency_hz <= 0:
+        return "Silent / no detected spikes", "I0 recording present; zero spikes detected", ""
+    if frequency_hz < SPARSE_HZ_THRESHOLD:
+        return "Sparse firing / near-silent", f"Rate < {SPARSE_HZ_THRESHOLD:g} Hz", ""
+    if n_spikes < MIN_SPIKES_FOR_PATTERN_CLASSIFICATION:
+        return "Sparse firing / too few spikes for pattern", f"Fewer than {MIN_SPIKES_FOR_PATTERN_CLASSIFICATION} detected spikes", ""
+    if not np.isfinite(cv2):
+        return "Unclassified pattern", "CV2 unavailable (insufficient within-sweep intervals)", ""
+    tonic = (cv2 <= TONIC_MEDIAN_CV2_MAX
+             and (not np.isfinite(isi_cv) or isi_cv <= TONIC_ISI_CV_MAX)
+             and (not np.isfinite(pause_fraction) or pause_fraction <= TONIC_MAX_PAUSE_FRACTION))
+    warning = "ISI CV and/or pause fraction unavailable; CV2-driven classification" if (not np.isfinite(isi_cv) or not np.isfinite(pause_fraction)) else ""
+    if tonic:
+        return "Regular tonic firing", "CV2, available ISI CV, and pause fraction satisfy tonic thresholds", warning
+    reasons = []
+    if cv2 > TONIC_MEDIAN_CV2_MAX:
+        reasons.append("CV2 above threshold")
+    if np.isfinite(isi_cv) and isi_cv > TONIC_ISI_CV_MAX:
+        reasons.append("ISI CV above threshold")
+    if np.isfinite(pause_fraction) and pause_fraction > TONIC_MAX_PAUSE_FRACTION:
+        reasons.append("long-pause fraction above threshold")
+    return "Irregular firing", "; ".join(reasons), warning
+
+
+def make_firing_classification(roster: pd.DataFrame, runs: pd.DataFrame) -> pd.DataFrame:
+    """One row per roster cell; summarise ALL successfully recorded I0 runs."""
+    recs = []
+    i0 = runs[runs["CanonicalProtocol"] == "i0"] if not runs.empty else pd.DataFrame()
+    for _, cellrow in roster.iterrows():
+        cell = cellrow["Cell"]
+        g = i0[i0["Cell"] == cell] if not i0.empty else pd.DataFrame()
+        result = {"Date": cellrow.get("Date"), "Cell": cell,
+                  "CellHeaderRaw": cellrow.get("CellHeaderRaw"),
+                  "I0_Runs_N": len(g)}
+        if g.empty:
+            rate, count, cv2, isi_cv, pause = (np.nan, 0, np.nan, np.nan, np.nan)
+            duration = 0.0
+        else:
+            duration = float(g["i0_duration_s"].sum())
+            count = int(g["i0_n_spikes"].sum())
+            rate = count / duration if duration > 0 else np.nan
+            cv2 = float(g["i0_cv2"].mean())
+            isi_cv = float(g["i0_isi_cv"].mean())
+            pause = float(g["i0_pause_fraction"].mean())
+        cls, reason, warning = classify_firing(rate, count, cv2, isi_cv, pause, not g.empty)
+        result.update({"Firing_Type": cls, "Classification_Reason": reason,
+                       "Classification_Warning": warning,
+                       "I0_TotalDuration_s": duration if not g.empty else np.nan,
+                       "I0_N_Spikes": count if not g.empty else np.nan,
+                       "FiringRate_Hz_For_Classification": rate,
+                       "CV2_For_Classification": cv2,
+                       "ISI_CV_For_Classification": isi_cv,
+                       "Pause_Fraction_For_Classification": pause,
+                       "BurstLike_ISI_Fraction": float(g["i0_burstlike_fraction"].mean()) if not g.empty else np.nan})
+        recs.append(result)
+    return pd.DataFrame(recs)
+
+
+def classification_thresholds() -> pd.DataFrame:
+    return pd.DataFrame([
+        ("Sparse_Hz_Threshold", SPARSE_HZ_THRESHOLD, "Positive firing below this is near-silent"),
+        ("Minimum_Spikes_For_Pattern", MIN_SPIKES_FOR_PATTERN_CLASSIFICATION, "Minimum spike count for tonic/irregular classification"),
+        ("Tonic_CV2_Max", TONIC_MEDIAN_CV2_MAX, "Mean of per-run median within-sweep CV2"),
+        ("Tonic_ISI_CV_Max", TONIC_ISI_CV_MAX, "Where available"),
+        ("Pause_ISI_Threshold_s", PAUSE_ISI_THRESHOLD_SECONDS, "Long pause definition"),
+        ("Tonic_Max_Pause_Fraction", TONIC_MAX_PAUSE_FRACTION, "Where available"),
+        ("BurstLike_ISI_Threshold_s", BURSTLIKE_ISI_THRESHOLD_SECONDS, "Descriptive only; not a burst classifier"),
+    ], columns=["Setting", "Value", "Description"])
+
+
+def analyze_rheo(abf: pyabf.ABF) -> Tuple[dict, pd.DataFrame]:
+    fs = get_fs(abf)
+
+    thr_vals = []
+    rheo_vals = []
+    ramp_spike_counts = []
+    ramp_max_instfreqs = []
+    ramp_last_currents = []
+    depol_block_flags = []
+    depol_block_currents = []
+    depol_block_vms = []
+
+    per_sweep_rows = []
+
+    for sw in range(abf.sweepCount):
+        abf.setSweep(sw, channel=0)
+        if abf.sweepUnitsY.lower() != "mv":
+            continue
+
+        v = abf.sweepY.astype(float)
+
+        try:
+            cmd = abf.sweepC.astype(float)
+            cmd_units = getattr(abf, "sweepUnitsC", None)
+            cmd = cmd * unit_to_scale_to_pA(cmd_units)
+        except Exception:
+            cmd = None
+
+        ramp_a, ramp_b = find_ramp_window_from_command(cmd, fs, v.size)
+
+        all_spikes = detect_spikes_dvdt(
+            v,
+            fs,
+            dvdt_thresh_V_per_s=DV_DT_THRESH_RHEO_V_PER_S,
+            min_peak_mV=None,
+            min_amp_from_thresh_mV=RHEO_MIN_AP_AMP_FROM_THRESH_MV,
+        )
+        spikes = subset_spikes_to_window(all_spikes, ramp_a, ramp_b)
+        ramp_met = compute_ramp_metrics(v, cmd, fs, spikes, ramp_a, ramp_b)
+
+        ap_thr = np.nan
+        rheo = np.nan
+        if spikes:
+            s0 = spikes[0]
+            ap_thr = float(s0["thr_mV"])
+            if cmd is not None and cmd.size == v.size:
+                rheo = float(cmd[s0["thr_idx"]])
+
+            thr_vals.append(ap_thr)
+            if np.isfinite(rheo):
+                rheo_vals.append(rheo)
+
+        ramp_spike_counts.append(float(ramp_met["Ramp_SpikeCount_N"]))
+        if np.isfinite(ramp_met["Ramp_MaxInstFreq_Hz"]):
+            ramp_max_instfreqs.append(float(ramp_met["Ramp_MaxInstFreq_Hz"]))
+        if np.isfinite(ramp_met["Ramp_LastSpikeCurrent_pA"]):
+            ramp_last_currents.append(float(ramp_met["Ramp_LastSpikeCurrent_pA"]))
+        depol_block_flags.append(float(ramp_met["Ramp_DepolBlock_bool"]))
+        if np.isfinite(ramp_met["Ramp_DepolBlock_Current_pA"]):
+            depol_block_currents.append(float(ramp_met["Ramp_DepolBlock_Current_pA"]))
+        if np.isfinite(ramp_met["Ramp_DepolBlock_Vm_mV"]):
+            depol_block_vms.append(float(ramp_met["Ramp_DepolBlock_Vm_mV"]))
+
+        per_sweep_rows.append({
+            "Sweep": sw,
+            "RampStart_s": float(ramp_met["RampStart_s"]),
+            "RampEnd_s": float(ramp_met["RampEnd_s"]),
+            "RampDuration_s": float(ramp_met["RampDuration_s"]),
+            "AP_Thresh_mV": float(ap_thr) if np.isfinite(ap_thr) else np.nan,
+            "Rheobase_pA": float(rheo) if np.isfinite(rheo) else np.nan,
+            "Ramp_SpikeCount_N": int(ramp_met["Ramp_SpikeCount_N"]),
+            "Ramp_MaxInstFreq_Hz": float(ramp_met["Ramp_MaxInstFreq_Hz"]) if np.isfinite(ramp_met["Ramp_MaxInstFreq_Hz"]) else np.nan,
+            "Ramp_LastSpikeCurrent_pA": float(ramp_met["Ramp_LastSpikeCurrent_pA"]) if np.isfinite(ramp_met["Ramp_LastSpikeCurrent_pA"]) else np.nan,
+            "Ramp_DepolBlock_bool": float(ramp_met["Ramp_DepolBlock_bool"]),
+            "Ramp_DepolBlock_Current_pA": float(ramp_met["Ramp_DepolBlock_Current_pA"]) if np.isfinite(ramp_met["Ramp_DepolBlock_Current_pA"]) else np.nan,
+            "Ramp_DepolBlock_Vm_mV": float(ramp_met["Ramp_DepolBlock_Vm_mV"]) if np.isfinite(ramp_met["Ramp_DepolBlock_Vm_mV"]) else np.nan,
+        })
+
+    df_sweeps = pd.DataFrame(per_sweep_rows)
+
+    out = {
+        "AP_Thresh_mV": nanmed(thr_vals),
+        "Rheobase_pA": nanmed(rheo_vals),
+        "Ramp_SpikeCount_N": nanmed(ramp_spike_counts),
+        "Ramp_MaxInstFreq_Hz": nanmed(ramp_max_instfreqs),
+        "Ramp_LastSpikeCurrent_pA": nanmed(ramp_last_currents),
+        "Ramp_DepolBlock_bool": float(np.max(depol_block_flags)) if len(depol_block_flags) else np.nan,
+        "Ramp_DepolBlock_Current_pA": nanmed(depol_block_currents),
+        "Ramp_DepolBlock_Vm_mV": nanmed(depol_block_vms),
+    }
+    return out, df_sweeps
+
+
+# =========================
+# QC structures
+# =========================
+@dataclass
+class QCRow:
+    File: str
+    TxtDate: Optional[str]
+    FileDate: Optional[str]
+    DateMatch: bool
+    FilenamePatternOK: bool
+    HasEventsSuffix: bool
+    ProgID: Optional[str]
+    Cell: str
+    TxtProtocolRaw: Optional[str]
+    CanonicalProtocol: Optional[str]
+    Action: str
+    Status: str
+    Warnings: str
+    Error: str
+
+
+def warn_join(w: List[str]) -> str:
+    return "; ".join(w) if w else ""
+
+
+# =========================
+# Main
+# =========================
+def main():
+    in_dir = Path(INPUT_PATH).expanduser().resolve()
+    out_dir = Path(OUTPUT_PATH).expanduser().resolve()
+    ensure_dir(out_dir)
+
+    txt_path = find_mapping_txt(in_dir)
+    if txt_path is None:
+        raise RuntimeError(f"No .txt notes file found in {in_dir}")
+
+    txt_date = date_from_txt_filename(txt_path)
+    meta, cell_blocks, _ = parse_txt_cells_and_metadata(txt_path)
+
+    logfile = out_dir / f"{txt_path.stem}_log.txt"
+    global LOGGER
+    LOGGER = DualLogger(logfile)
+
+    output_main_xlsx = out_dir / f"{txt_path.stem}_output.xlsx"
+    output_1ap_xlsx = out_dir / f"{txt_path.stem}_1AP.xlsx"
+
+    txt_map: Dict[Tuple[str, str], str] = {}
+    for cb in cell_blocks:
+        for pid, pname in cb.prog_map.items():
+            txt_map[(cb.cell_label, pid)] = pname
+
+    df_meta_global = pd.DataFrame([{"TxtFile": txt_path.name, "TxtDate": txt_date, **meta}])
+    df_meta_cell = pd.DataFrame([{
+        "Cell": cb.cell_label,
+        "CellHeaderRaw": " | ".join([x.strip() for x in cb.header_lines if x.strip()]),
+        "ProgMapCount": len(cb.prog_map),
+    } for cb in cell_blocks])
+
+    abf_files = sorted(in_dir.glob("*.abf"))
+
+    log(f"INPUT_PATH:  {in_dir}")
+    log(f"OUTPUT_PATH: {out_dir}")
+    log(f"TXT notes:   {txt_path.name}")
+    log(f"TXT date:    {txt_date}")
+    log(f"Found {len(cell_blocks)} cell blocks in TXT")
+    log(f"Found {len(abf_files)} .abf files in folder")
+    log(f"Log file:    {logfile.name}")
+    log(f"IVCC step window (FIXED): {IVCC_STEP_WIN_START_S:.3f} -> {IVCC_STEP_WIN_END_S:.3f} s (rebound after end)")
+    log("----")
+
+    qc_rows: List[QCRow] = []
+    summary_runs = []
+    ivcc_steps_runs = []
+    ivcc_1ap_runs = []
+    rheo_sweeps_runs = []
+    i0_spike_times_rows = []
+
+    oneap_waveforms: Dict[str, Dict[int, Dict[str, np.ndarray]]] = {}
+
+    def infer_cell_from_filename(stem: str) -> str:
+        m = re.search(r"(Cell\s*\d+)", stem, re.IGNORECASE)
+        if m:
+            num = re.search(r"\d+", m.group(1)).group(0)
+            return f"Cell {num}"
+        return "Unknown"
+
+    current_cell = None
+
+    for i, abf_path in enumerate(abf_files, start=1):
+        warnings: List[str] = []
+        fdate, progid, pattern_ok, has_events = infer_date_and_progid_from_abf_name(abf_path.name)
+        date_match = (txt_date is not None and fdate == txt_date)
+
+        log(f"[{i}/{len(abf_files)}] Checking {abf_path.name}")
+
+        cell = infer_cell_from_filename(abf_path.stem)
+
+        txt_proto = None
+        if progid is not None:
+            pid_str = str(progid).zfill(4)
+            txt_proto = txt_map.get((cell, pid_str))
+            if txt_proto is None:
+                for (c, p), nm in txt_map.items():
+                    if p == pid_str:
+                        txt_proto = nm
+                        cell = c
+                        break
+            progid = pid_str
+
+        canon = canonical_protocol(txt_proto) if txt_proto else None
+
+        if cell != current_cell and cell != "Unknown":
+            current_cell = cell
+            log(f"\n=== Now processing {cell} ===")
+
+        if has_events:
+            log("  SKIP: contains 'Events' in filename")
+            qc_rows.append(QCRow(abf_path.name, txt_date, fdate, date_match, pattern_ok, has_events,
+                                 progid, cell, txt_proto, canon, "skip_events_suffix", "SKIP", "", ""))
+            continue
+        if not pattern_ok:
+            log("  SKIP: filename not exactly YYYY_MM_DD_####.abf")
+            qc_rows.append(QCRow(abf_path.name, txt_date, fdate, date_match, pattern_ok, has_events,
+                                 progid, cell, txt_proto, canon, "skip_bad_filename_pattern", "SKIP",
+                                 "Bad filename pattern", ""))
+            continue
+        if txt_date is not None and not date_match:
+            log(f"  SKIP: wrong date (file {fdate} != txt {txt_date})")
+            qc_rows.append(QCRow(abf_path.name, txt_date, fdate, date_match, pattern_ok, has_events,
+                                 progid, cell, txt_proto, canon, "skip_wrong_date", "SKIP",
+                                 "Wrong date", ""))
+            continue
+        if canon == "IGNORE":
+            log(f"  SKIP: ignored protocol '{txt_proto}'")
+            qc_rows.append(QCRow(abf_path.name, txt_date, fdate, True, True, False,
+                                 progid, cell, txt_proto, canon, "skip_ignore_protocol", "SKIP",
+                                 "Ignore i0 at -60", ""))
+            continue
+        if canon is None:
+            log(f"  SKIP: unknown protocol '{txt_proto}'")
+            qc_rows.append(QCRow(abf_path.name, txt_date, fdate, True, True, False,
+                                 progid, cell, txt_proto, canon, "skip_unknown_protocol", "SKIP",
+                                 "Unknown protocol", ""))
+            continue
+
+        try:
+            abf = pyabf.ABF(str(abf_path))
+        except Exception as e:
+            log(f"  FAIL: couldn't load ABF: {e}")
+            qc_rows.append(QCRow(abf_path.name, txt_date, fdate, True, True, False,
+                                 progid, cell, txt_proto, canon, "load_abf", "FAIL", "", str(e)))
+            continue
+
+        fs = get_fs(abf)
+        log(f"  OK: Cell={cell}, ProgID={progid}, Protocol='{txt_proto}' -> {canon} (fs={fs:.1f} Hz, sweeps={abf.sweepCount})")
+
+        base = {
+            "Date": txt_date,
+            "Cell": cell,
+            "ProgID": progid,
+            "File": abf_path.name,
+            "TxtProtocol": txt_proto,
+            "CanonicalProtocol": canon,
+        }
+        for k, v in meta.items():
+            base[f"meta_{k}"] = v
+
+        try:
+            if canon == "i0":
+                out, spk = analyze_i0(abf)
+                cls, reason, warn = classify_firing(
+                    out["i0_freq_hz"], out["i0_n_spikes"], out["i0_cv2"],
+                    out["i0_isi_cv"], out["i0_pause_fraction"])
+                summary_runs.append({**base, **out, "Firing_Type": cls,
+                                     "Classification_Reason": reason,
+                                     "Classification_Warning": warn})
+                for st in spk:
+                    i0_spike_times_rows.append({**base, "SpikeTime_s": float(st)})
+                log(f"  DONE: i0 spikes={out.get('i0_n_spikes')} freq={out.get('i0_freq_hz', np.nan):.3f}Hz CV2={out.get('i0_cv2', np.nan)}")
+                qc_rows.append(QCRow(abf_path.name, txt_date, fdate, True, True, False,
+                                     progid, cell, txt_proto, canon, "analyze_i0", "OK",
+                                     warn_join(warnings), ""))
+
+            elif canon == "rheo":
+                out, df_rheo = analyze_rheo(abf)
+                summary_runs.append({**base, **out})
+
+                for _, r in df_rheo.iterrows():
+                    rheo_sweeps_runs.append({**base, **r.to_dict()})
+
+                log(
+                    "  DONE: rheo "
+                    f"thr={out.get('AP_Thresh_mV', np.nan)}mV "
+                    f"rheobase={out.get('Rheobase_pA', np.nan)}pA "
+                    f"ramp_spikes={out.get('Ramp_SpikeCount_N', np.nan)} "
+                    f"block={out.get('Ramp_DepolBlock_bool', np.nan)} "
+                    f"block_I={out.get('Ramp_DepolBlock_Current_pA', np.nan)}pA"
+                )
+                qc_rows.append(QCRow(abf_path.name, txt_date, fdate, True, True, False,
+                                     progid, cell, txt_proto, canon, "analyze_rheo", "OK",
+                                     warn_join(warnings), ""))
+
+            elif canon == "ivcc":
+                summ, df_steps, df_1ap, wave_snips = analyze_ivcc(abf)
+                summary_runs.append({**base, **summ})
+
+                if df_steps.empty:
+                    warnings.append("IVCC: no valid sweeps/steps detected (check sweepC/time window)")
+                    log("  WARN: IVCC produced no step rows")
+                else:
+                    n_unique = df_steps["Step_pA"].nunique() if "Step_pA" in df_steps.columns else "NA"
+                    log(f"  IVCC: rows={len(df_steps)} unique steps={n_unique}")
+
+                for _, r in df_steps.iterrows():
+                    ivcc_steps_runs.append({**base, **r.to_dict()})
+                for _, r in df_1ap.iterrows():
+                    ivcc_1ap_runs.append({**base, **r.to_dict()})
+
+                if cell not in oneap_waveforms:
+                    oneap_waveforms[cell] = {}
+                if progid is not None and progid.isdigit():
+                    oneap_waveforms[cell][int(progid)] = wave_snips
+
+                log(
+                    "  DONE: ivcc "
+                    f"Rin={summ.get('InputResistance_GOhm', np.nan)} GΩ "
+                    f"Tau={summ.get('TimeConstant_ms', np.nan)} ms "
+                    f"Cm={summ.get('Capacitance_pF', np.nan)} pF "
+                    f"MaxStepFreq={summ.get('MaxStepFreq_Hz', np.nan)} Hz "
+                    f"Adapt={summ.get('AdaptationIndex', np.nan)}"
+                )
+                qc_rows.append(QCRow(abf_path.name, txt_date, fdate, True, True, False,
+                                     progid, cell, txt_proto, canon, "analyze_ivcc", "OK",
+                                     warn_join(warnings), ""))
+
+
+        except Exception as e:
+            log(f"  FAIL during analysis: {e}")
+            qc_rows.append(QCRow(abf_path.name, txt_date, fdate, True, True, False,
+                                 progid, cell, txt_proto, canon, f"analyze_{canon}", "FAIL",
+                                 warn_join(warnings), str(e)))
+            continue
+
+    df_qc = pd.DataFrame([asdict(r) for r in qc_rows])
+    df_runs = pd.DataFrame(summary_runs)
+    df_iv_steps = pd.DataFrame(ivcc_steps_runs)
+    df_iv_1ap = pd.DataFrame(ivcc_1ap_runs)
+    df_rheo_sweeps = pd.DataFrame(rheo_sweeps_runs)
+    df_i0_times = pd.DataFrame(i0_spike_times_rows)
+    # TXT contains the full roster, including silent cells with empty spike-time sheets.
+    roster = df_meta_cell.copy()
+    roster.insert(0, "Date", txt_date)
+    df_firing = make_firing_classification(roster, df_runs) if not roster.empty else pd.DataFrame(columns=["Cell", "Firing_Type", "Classification_Reason"])
+    df_firing_counts = (df_firing.groupby("Firing_Type", dropna=False)
+                        .size().reset_index(name="N_Cells"))
+
+    df_summary_wide = pd.DataFrame()
+    df_cellsheet_summary = pd.DataFrame()
+    if not df_runs.empty:
+        tmp = df_runs.copy()
+        tmp["ProgID_sort"] = tmp["ProgID"].astype(str)
+        tmp = tmp.sort_values(["Date", "Cell", "CanonicalProtocol", "ProgID_sort"])
+
+        requested_summary_cols = [
+            "Date",
+            "Cell",
+            "meta_Metadata_Raw",
+            "Firing_Type",
+            "Classification_Reason",
+            "RMP_mV_Avg",
+            "RMP_Freq_Hz_Avg",
+            "CV2_Avg",
+            "AP_Threshold_mV_Avg",
+            "Rheobase_pA_Avg",
+            "Ramp_MaxInstFreq_Hz_Avg",
+            "Ramp_DepolBlock_Vm_mV_Avg",
+            "InputResistance_GOhm_Avg",
+            "TimeConstant_ms_Avg",
+            "Cm_pF_Avg",
+            "Sag_ratio_Avg",
+            "ReboundSpikes_N_Avg",
+            "AP_Amp_fromBaseline_mV_Avg",
+            "AP_MaxSpeed_V_per_s_Avg",
+            "AP_Halfwidth_ms_Avg",
+            "AP_fAHP_Depth_mV_Avg",
+        ]
+
+        summary_metric_map = [
+            ("i0", "RMP_mV", "RMP_mV_Avg"),
+            ("i0", "i0_freq_hz", "RMP_Freq_Hz_Avg"),
+            ("i0", "i0_cv2", "CV2_Avg"),
+
+            ("rheo", "AP_Thresh_mV", "AP_Threshold_mV_Avg"),
+            ("rheo", "Rheobase_pA", "Rheobase_pA_Avg"),
+            ("rheo", "Ramp_MaxInstFreq_Hz", "Ramp_MaxInstFreq_Hz_Avg"),
+            ("rheo", "Ramp_DepolBlock_Vm_mV", "Ramp_DepolBlock_Vm_mV_Avg"),
+
+            ("ivcc", "InputResistance_GOhm", "InputResistance_GOhm_Avg"),
+            ("ivcc", "TimeConstant_ms", "TimeConstant_ms_Avg"),
+            ("ivcc", "Capacitance_pF", "Cm_pF_Avg"),
+            ("ivcc", "Sag_ratio", "Sag_ratio_Avg"),
+            ("ivcc", "ReboundSpikes_N", "ReboundSpikes_N_Avg"),
+            ("ivcc", "AP_Amp_fromBaseline_mV", "AP_Amp_fromBaseline_mV_Avg"),
+            ("ivcc", "AP_MaxSpeed_V_per_s", "AP_MaxSpeed_V_per_s_Avg"),
+            ("ivcc", "AP_Halfwidth_ms", "AP_Halfwidth_ms_Avg"),
+            ("ivcc", "AP_fAHP_Depth_mV", "AP_fAHP_Depth_mV_Avg"),
+
+        ]
+
+        cellsheet_metric_map = [
+            # i0
+            ("i0", "RMP_mV", "RMP_mV"),
+            ("i0", "i0_freq_hz", "RMP_Freq_Hz"),
+            ("i0", "i0_isi_mean_s", "ISI_Mean_s"),
+            ("i0", "i0_isi_median_s", "ISI_Median_s"),
+            ("i0", "i0_cv2", "CV2"),
+            ("i0", "i0_fano_1s", "Fano_1s"),
+
+            # rheo
+            ("rheo", "AP_Thresh_mV", "AP_Threshold_mV"),
+            ("rheo", "Rheobase_pA", "Rheobase_pA"),
+            ("rheo", "Ramp_SpikeCount_N", "Ramp_SpikeCount_N"),
+            ("rheo", "Ramp_MaxInstFreq_Hz", "Ramp_MaxInstFreq_Hz"),
+            ("rheo", "Ramp_LastSpikeCurrent_pA", "Ramp_LastSpikeCurrent_pA"),
+            ("rheo", "Ramp_DepolBlock_bool", "Ramp_DepolBlock_bool"),
+            ("rheo", "Ramp_DepolBlock_Current_pA", "Ramp_DepolBlock_Current_pA"),
+            ("rheo", "Ramp_DepolBlock_Vm_mV", "Ramp_DepolBlock_Vm_mV"),
+
+            # ivcc
+            ("ivcc", "InputResistance_GOhm", "InputResistance_GOhm"),
+            ("ivcc", "TimeConstant_ms", "TimeConstant_ms"),
+            ("ivcc", "Capacitance_pF", "Cm_pF"),
+            ("ivcc", "MaxStepFreq_Hz", "MaxStepFreq_Hz"),
+            ("ivcc", "FI_slope_Hz_per_pA", "FI_slope_Hz_per_pA"),
+            ("ivcc", "AdaptationIndex", "AdaptationIndex"),
+            ("ivcc", "AdaptationStep_pA", "AdaptationStep_pA"),
+            ("ivcc", "Sag_ratio", "Sag_ratio"),
+            ("ivcc", "Rebound_bool", "Rebound_bool"),
+            ("ivcc", "ReboundSpikes_N", "ReboundSpikes_N"),
+            ("ivcc", "ReboundFirstLatency_s", "ReboundFirstLatency_s"),
+            ("ivcc", "AP_LocalBaseline_mV", "AP_LocalBaseline_mV"),
+            ("ivcc", "AP_Peak_mV", "AP_Peak_mV"),
+            ("ivcc", "AP_Amp_fromBaseline_mV", "AP_Amp_fromBaseline_mV"),
+            ("ivcc", "AP_MaxSpeed_V_per_s", "AP_MaxSpeed_V_per_s"),
+            ("ivcc", "AP_Halfwidth_ms", "AP_Halfwidth_ms"),
+            ("ivcc", "AP_fAHP_Vmin_mV", "AP_fAHP_Vmin_mV"),
+            ("ivcc", "AP_fAHP_Depth_mV", "AP_fAHP_Depth_mV"),
+            ("ivcc", "AP_mAHP_Vmin_mV", "AP_mAHP_Vmin_mV"),
+            ("ivcc", "AP_mAHP_Depth_mV", "AP_mAHP_Depth_mV"),
+
+        ]
+
+        rows = []
+        cellsheet_rows = []
+        tmp["RunIndex"] = tmp.groupby(["Date", "Cell", "CanonicalProtocol"]).cumcount() + 1
+
+        for (d, c), gcell in tmp.groupby(["Date", "Cell"]):
+            row = {"Date": d, "Cell": c}
+
+            if "meta_Metadata_Raw" in gcell.columns:
+                vv = gcell["meta_Metadata_Raw"].dropna()
+                row["meta_Metadata_Raw"] = vv.iloc[0] if not vv.empty else np.nan
+            else:
+                row["meta_Metadata_Raw"] = np.nan
+
+            for proto, src, outn in summary_metric_map:
+                g = gcell[gcell["CanonicalProtocol"] == proto]
+                if src not in g.columns:
+                    row[outn] = np.nan
+                    continue
+                vals = g[src].dropna()
+                row[outn] = float(vals.mean()) if not vals.empty else np.nan
+
+            match = df_firing[df_firing["Cell"] == c]
+            if not match.empty:
+                row["Firing_Type"] = match.iloc[0]["Firing_Type"]
+                row["Classification_Reason"] = match.iloc[0]["Classification_Reason"]
+            rows.append(row)
+
+            cell_row = {"Date": d, "Cell": c}
+            for col in gcell.columns:
+                if isinstance(col, str) and col.startswith("meta_"):
+                    vv = gcell[col].dropna()
+                    if not vv.empty:
+                        cell_row[col] = vv.iloc[0]
+
+            for proto, src, outn in cellsheet_metric_map:
+                g = gcell[gcell["CanonicalProtocol"] == proto]
+                if src not in g.columns:
+                    for r in [1, 2, 3]:
+                        cell_row[f"{outn}_Run{r}"] = np.nan
+                    cell_row[f"{outn}_Avg"] = np.nan
+                    continue
+
+                for r in [1, 2, 3]:
+                    vv = g.loc[g["RunIndex"] == r, src].dropna()
+                    cell_row[f"{outn}_Run{r}"] = float(vv.iloc[0]) if len(vv) > 0 else np.nan
+
+                vv_all = g[src].dropna()
+                cell_row[f"{outn}_Avg"] = float(vv_all.mean()) if not vv_all.empty else np.nan
+
+            rmp_avg = cell_row.get("RMP_mV_Avg", np.nan)
+            thr_avg = cell_row.get("AP_Threshold_mV_Avg", np.nan)
+            cell_row["Thresh_Depol_mV"] = float(thr_avg - rmp_avg) if (np.isfinite(rmp_avg) and np.isfinite(thr_avg)) else np.nan
+            if not match.empty:
+                cell_row["Firing_Type"] = match.iloc[0]["Firing_Type"]
+                cell_row["Classification_Reason"] = match.iloc[0]["Classification_Reason"]
+            cellsheet_rows.append(cell_row)
+
+        df_summary_wide = pd.DataFrame(rows)
+        for col in requested_summary_cols:
+            if col not in df_summary_wide.columns:
+                df_summary_wide[col] = np.nan
+        df_summary_wide = df_summary_wide[requested_summary_cols].sort_values(["Date", "Cell"])
+        df_cellsheet_summary = pd.DataFrame(cellsheet_rows).sort_values(["Date", "Cell"])
+
+    df_iv_voltage_wide = pd.DataFrame()
+    df_iv_freq_wide = pd.DataFrame()
+    df_iv_lat_wide = pd.DataFrame()
+    df_iv_spikes_wide = pd.DataFrame()
+
+    if not df_iv_steps.empty:
+        tmp = df_iv_steps.copy()
+        tmp["ProgID_sort"] = tmp["ProgID"].astype(str)
+        tmp = tmp.sort_values(["Date", "Cell", "ProgID_sort", "Step_pA"])
+        tmp["RunIndex"] = tmp.groupby(["Date", "Cell", "File"]).ngroup()
+        tmp["RunIndex"] = tmp.groupby(["Date", "Cell"])["RunIndex"].rank(method="dense").astype(int)
+
+        def make_wide(value_col: str, prefix: str) -> pd.DataFrame:
+            g = tmp[["Date", "Cell", "Step_pA", "RunIndex", value_col]].copy()
+            wide = g.pivot_table(index=["Date", "Cell", "Step_pA"], columns="RunIndex", values=value_col, aggfunc="first")
+            wide = wide.rename(columns=lambda k: f"{prefix}_Run{int(k)}")
+            wide[f"{prefix}_Avg"] = wide.mean(axis=1, skipna=True)
+            return wide.reset_index()
+
+        df_iv_voltage_wide = make_wide("V_ss_mV", "V_ss_mV")
+        df_iv_freq_wide = make_wide("Freq_Hz", "SpikesPerStep_Hz")
+        df_iv_lat_wide = make_wide("FirstLatency_s", "FirstLatency_s")
+        df_iv_spikes_wide = make_wide("Spikes_N", "Spikes_N")
+
+    log("----")
+    log("Writing main Excel workbook...")
+    with pd.ExcelWriter(output_main_xlsx, engine="openpyxl") as writer:
+        df_qc.to_excel(writer, sheet_name="QC", index=False)
+        df_meta_global.to_excel(writer, sheet_name="Metadata_Global", index=False)
+        df_meta_cell.to_excel(writer, sheet_name="Metadata_Cell", index=False)
+        df_firing.to_excel(writer, sheet_name="Firing_Type_Classification", index=False)
+        df_firing_counts.to_excel(writer, sheet_name="Firing_Type_Counts", index=False)
+        classification_thresholds().to_excel(writer, sheet_name="Thresholds_Used", index=False)
+        if not df_runs.empty:
+            df_runs.to_excel(writer, sheet_name="Protocol_Runs_Long", index=False)
+
+        if not df_cellsheet_summary.empty:
+            for _, r in df_cellsheet_summary.iterrows():
+                cell = str(r.get("Cell", "Unknown"))
+                date = str(r.get("Date", ""))
+                sheet = safe_sheet_name(f"{cell}_Summary")
+
+                df_vert = make_vertical_summary_from_row(r)
+                header = pd.DataFrame([
+                    {"Metric": "Date", "Run1": date, "Run2": np.nan, "Run3": np.nan, "Avg": np.nan},
+                    {"Metric": "Cell", "Run1": cell, "Run2": np.nan, "Run3": np.nan, "Avg": np.nan},
+                    {"Metric": "----", "Run1": "Summary metrics", "Run2": np.nan, "Run3": np.nan, "Avg": np.nan},
+                ])
+                df_out = pd.concat([header, df_vert], ignore_index=True)
+                df_out.to_excel(writer, sheet_name=sheet, index=False, startrow=0)
+
+                start = len(df_out) + 2
+
+                def write_ivcc_block(df_block: pd.DataFrame, title: str, startrow: int) -> int:
+                    if df_block.empty:
+                        return startrow
+                    pd.DataFrame([{"": title}]).to_excel(
+                        writer, sheet_name=sheet, index=False, header=False, startrow=startrow
+                    )
+                    df_block.to_excel(writer, sheet_name=sheet, index=False, startrow=startrow + 1)
+                    return startrow + 2 + len(df_block) + 1
+
+                if not df_iv_voltage_wide.empty:
+                    blk = df_iv_voltage_wide[(df_iv_voltage_wide["Date"] == date) & (df_iv_voltage_wide["Cell"] == cell)].copy().sort_values("Step_pA")
+                    start = write_ivcc_block(blk, "IVCC: V_ss (mV) per Step (pA)", start)
+
+                if not df_iv_spikes_wide.empty:
+                    blk = df_iv_spikes_wide[(df_iv_spikes_wide["Date"] == date) & (df_iv_spikes_wide["Cell"] == cell)].copy().sort_values("Step_pA")
+                    start = write_ivcc_block(blk, "IVCC: Spikes_N per Step (pA)", start)
+
+                if not df_iv_lat_wide.empty:
+                    blk = df_iv_lat_wide[(df_iv_lat_wide["Date"] == date) & (df_iv_lat_wide["Cell"] == cell)].copy().sort_values("Step_pA")
+                    start = write_ivcc_block(blk, "IVCC: First spike latency (s) per Step (pA)", start)
+
+        if not df_summary_wide.empty:
+            df_summary_wide.to_excel(writer, sheet_name="Summary_Wide", index=False)
+
+        if not df_rheo_sweeps.empty:
+            df_rheo_sweeps.to_excel(writer, sheet_name="Rheo_Sweeps_Long", index=False)
+
+        if not df_iv_steps.empty:
+            df_iv_steps.to_excel(writer, sheet_name="IVCC_Steps_Long", index=False)
+
+        if not df_iv_voltage_wide.empty:
+            df_iv_voltage_wide.to_excel(writer, sheet_name="IVCC_Voltage", index=False)
+        if not df_iv_freq_wide.empty:
+            df_iv_freq_wide.to_excel(writer, sheet_name="IVCC_SpikesPerStep", index=False)
+        if not df_iv_spikes_wide.empty:
+            df_iv_spikes_wide.to_excel(writer, sheet_name="IVCC_SpikesN", index=False)
+        if not df_iv_lat_wide.empty:
+            df_iv_lat_wide.to_excel(writer, sheet_name="IVCC_Latency", index=False)
+
+        if not df_iv_1ap.empty:
+            df_iv_1ap.to_excel(writer, sheet_name="AP_1AP_Features", index=False)
+        if not df_i0_times.empty:
+            df_i0_times.to_excel(writer, sheet_name="I0_SpikeTimes", index=False)
+
+    log(f"Wrote: {output_main_xlsx}")
+
+    log("Writing 1AP waveform workbook...")
+    sheets_written = 0
+    with pd.ExcelWriter(output_1ap_xlsx, engine="openpyxl") as writer:
+        for cell, by_pid in sorted(oneap_waveforms.items(), key=lambda x: x[0]):
+            pids = sorted(by_pid.keys())
+            runs = []
+            for pid in pids:
+                swsn = by_pid[pid]
+                if not swsn:
+                    continue
+                chosen = None
+                for sw in sorted(swsn.keys()):
+                    if chosen is None:
+                        chosen = swsn[sw]
+                    if "Step_pA" in swsn[sw]:
+                        if chosen is None or swsn[sw]["Step_pA"] < chosen["Step_pA"]:
+                            chosen = swsn[sw]
+                if chosen is not None:
+                    runs.append(chosen)
+
+            if not runs:
+                continue
+
+            t_ms = runs[0]["t_ms"]
+            df = pd.DataFrame({"time_ms": t_ms})
+
+            V_mat, D_mat = [], []
+            for i_run, sn in enumerate(runs, start=1):
+                df[f"V_Run{i_run}"] = sn["v_mV"]
+                df[f"dVdt_Run{i_run}"] = sn["dvdt_V_per_s"]
+                V_mat.append(sn["v_mV"])
+                D_mat.append(sn["dvdt_V_per_s"])
+
+            V_mat = np.vstack(V_mat)
+            D_mat = np.vstack(D_mat)
+            df["V_Avg"] = np.nanmean(V_mat, axis=0)
+            df["dVdt_Avg"] = np.nanmean(D_mat, axis=0)
+
+            df.to_excel(writer, sheet_name=safe_sheet_name(cell), index=False)
+            sheets_written += 1
+
+        if sheets_written == 0:
+            pd.DataFrame({
+                "Message": ["No IVCC first-AP waveforms were available to export."]
+            }).to_excel(writer, sheet_name="No_1AP_Data", index=False)
+            log("  WARN: no 1AP waveform sheets were available; wrote placeholder sheet instead")
+
+    log(f"Wrote: {output_1ap_xlsx}")
+    log("Done.")
+
+
+if __name__ == "__main__":
+    main()
